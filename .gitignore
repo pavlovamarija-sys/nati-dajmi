@@ -30,8 +30,10 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
-.env*.local
+# local environment files (never commit client configuration values)
+.env
+.env.*
+!.env.example
 
 # typescript
 *.tsbuildinfo
@@ -41,3 +43,36 @@ example
 # generated native folders
 /ios
 /android
+# Local Grounding DINO development artifacts
+tools/grounding-dino-test/.venv/
+tools/grounding-dino-test/.cache/
+tools/grounding-dino-test/output/
+tools/grounding-dino-test/__pycache__/
+tools/grounding-dino-test/*.jpg
+# Supabase local temp
+supabase/.temp/
+
+# Local design/content reference media
+Concept of sharing/
+novi foto/
+???? ??????? ?? ?/
+ChatGPT Image *.png
+Verspieltes Logo-Design *.png
+end_reference_rainbow.png
+home-analysis-camera.png
+home-analysis-card-reference.png
+home-analysis-toys.png
+home-screen-final-reference.png
+home-screen-reference.png
+nati-dajmi-logo.png
+photo-guide-*.png
+
+
+# Supabase local temp
+supabase/.temp/
+
+???? ??????? ?? ?/
+
+???? ??????? ?? ?/
+
+*???????*/

@@ -1,0 +1,1188 @@
+// @ts-ignore Deno resolves npm: specifiers when the Edge Function is bundled.
+import { createClient } from 'npm:@supabase/supabase-js@2.112.2';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import type { ToyLocalization, ToyLocalizationQuery } from './localization.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { ReplicateGroundingDinoProvider } from './replicate-grounding-dino.ts';
+
+type SupportedMimeType = 'image/jpeg' | 'image/png' | 'image/webp';
+type Recommendation = 'KEEP' | 'ROTATE' | 'PASS_ON';
+
+type AnalyzeToyShelfRequest = {
+  mode?: 'full-photo';
+  imageBase64: string;
+  mimeType: SupportedMimeType;
+  childAgeMonths: number;
+  imageWidth: number;
+  imageHeight: number;
+};
+
+type CandidateSemanticImage = {
+  candidateId: string;
+  imageBase64: string;
+  mimeType: 'image/jpeg';
+};
+
+type AnalyzeDetectedCandidatesRequest = {
+  mode: 'detected-candidates';
+  childAgeMonths: number;
+  candidateImages: CandidateSemanticImage[];
+};
+
+type PlayIdea = {
+  title: string;
+  description: string;
+};
+
+type BoundingBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type ModelToy = {
+  name: string;
+  category: string | null;
+  recommendation: Recommendation;
+  reason: string;
+  confidence: number | null;
+  playIdeas: PlayIdea[];
+};
+
+type ToyAnalysisItem = ModelToy & {
+  id: string;
+  boundingBox: BoundingBox | null;
+  candidateId?: string;
+};
+
+type ToyAnalysisResult = {
+  analysisId: string;
+  childAgeMonths: number;
+  toys: ToyAnalysisItem[];
+};
+
+type DenoRuntime = {
+  env: { get(name: string): string | undefined };
+  serve(handler: (request: Request) => Response | Promise<Response>): void;
+};
+
+declare const Deno: DenoRuntime;
+
+const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
+const OPENAI_MODEL = 'gpt-4o-mini';
+const MAX_TOY_ITEMS = 20;
+const supportedMimeTypes = new Set<SupportedMimeType>([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+
+const responseSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    toys: {
+      type: 'array',
+      maxItems: MAX_TOY_ITEMS,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string' },
+          category: { type: ['string', 'null'] },
+          recommendation: {
+            type: 'string',
+            enum: ['KEEP', 'ROTATE', 'PASS_ON'],
+          },
+          reason: { type: 'string' },
+          confidence: {
+            type: ['number', 'null'],
+            minimum: 0,
+            maximum: 1,
+          },
+          playIdeas: {
+            type: 'array',
+            maxItems: 3,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                title: { type: 'string' },
+                description: { type: 'string' },
+              },
+              required: ['title', 'description'],
+            },
+          },
+        },
+        required: [
+          'name',
+          'category',
+          'recommendation',
+          'reason',
+          'confidence',
+          'playIdeas',
+        ],
+      },
+    },
+  },
+  required: ['toys'],
+} as const;
+
+const analysisInstructions = `
+You analyze a photo of a toy shelf for a parent.
+
+First, silently perform a systematic visual inventory of the entire image. Carefully
+scan the top, middle, and bottom, and within each area scan the left, center, and
+right. Do not output scan notes or hidden reasoning.
+
+Look carefully for small toys as well as large, obvious toys. Consider toys that are
+partially occluded, inside baskets, stacked, or next to other toys. Make a careful
+effort to inspect small visible objects before deciding they cannot be identified.
+
+Identify visually distinct toys separately when reasonably possible. Group objects
+only when they are genuinely the same toy type or are too visually overlapping to
+distinguish reliably.
+
+Inspect only toys visibly present in the supplied image. Do not invent toys that
+cannot reasonably be seen. Missing a toy is preferable to confidently inventing one.
+
+When an object is visibly a toy but its exact identity is uncertain, prefer a cautious
+generic description such as "small toy vehicle", "wooden animal figure", "stacking
+toy", or "soft toy". Do not infer a brand name or specific product identity unless it
+is clearly visible in the image. A lower confidence score is appropriate for an
+uncertain-but-visible toy; omit an object if it cannot reasonably be identified as a
+toy.
+
+Return no more than ${MAX_TOY_ITEMS} visible toy items or groups. This is a maximum,
+not a target. If more are visible, prioritize the clearest distinguishable toys
+without inventing details. Consider the child's age supplied by the user.
+
+For each visible toy or group, choose exactly one recommendation:
+
+KEEP: The toy appears age-appropriate, useful, engaging, open-ended,
+developmentally valuable, or worth keeping accessible.
+
+ROTATE: The toy may still be useful but could be temporarily stored to reduce
+clutter, duplication, or overstimulation and reintroduced later.
+
+PASS_ON: The toy appears clearly outgrown, substantially duplicated, poorly matched
+to the child's current developmental stage, or unlikely to provide continued value.
+
+For every KEEP toy, return exactly 2 or 3 play ideas in playIdeas. Make each idea
+appropriate for the supplied child age in months and specifically use the detected
+toy in a varied, creative, or interesting way. Keep titles short and descriptions
+concise so a parent can understand them quickly. Avoid generic parenting advice and
+do not recommend buying extra products. Do not invent capabilities the visible toy
+clearly does not have. When identification is uncertain, use safe, generic play ideas
+that match the visible toy or category.
+
+For every ROTATE or PASS_ON toy, return playIdeas as an empty array. Do not generate
+play ideas for those recommendations.
+
+Never recommend disposal based on unsupported assumptions. Use a short,
+parent-friendly reason focused only on why the recommendation fits the child and toy.
+Do not discuss recognition uncertainty, visibility, occlusion, or image quality in the
+reason. Set category to null when a useful category is unclear. Set confidence to a
+number from 0 to 1 when reasonable, otherwise null. Return an empty toys array if no
+toys can be identified with reasonable confidence.
+`.trim();
+
+Deno.serve(async (request) => {
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (request.method !== 'POST') {
+    return jsonResponse({ error: 'Method not allowed.' }, 405, {
+      Allow: 'POST, OPTIONS',
+    });
+  }
+
+  const authentication = await authenticateRequest(request);
+
+  if (!authentication.ok) {
+    return jsonResponse(
+      { error: authentication.status === 401 ? 'Authentication required.' : 'Authentication service is not configured.' },
+      authentication.status,
+    );
+  }
+
+  let requestBody: unknown;
+
+  try {
+    requestBody = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Request body must be valid JSON.' }, 400);
+  }
+
+  const input = validateRequest(requestBody);
+
+  if (!input.ok) {
+    return jsonResponse({ error: input.error }, 400);
+  }
+
+  const apiKey = Deno.env.get('OPENAI_API_KEY')?.trim();
+
+  if (!apiKey) {
+    console.error('analyze-toy-shelf is missing its OPENAI_API_KEY secret.');
+    return jsonResponse({ error: 'Analysis service is not configured.' }, 500);
+  }
+
+  if (input.value.mode === 'detected-candidates') {
+    return analyzeDetectedCandidates(
+      input.value,
+      authentication.userId,
+      apiKey,
+    );
+  }
+
+  let openAIResponse: Response;
+
+  try {
+    openAIResponse = await fetch(OPENAI_RESPONSES_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        store: false,
+        max_output_tokens: 4000,
+        input: [
+          {
+            role: 'developer',
+            content: [{ type: 'input_text', text: analysisInstructions }],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text: `The child is ${input.value.childAgeMonths} months old.`,
+              },
+              {
+                type: 'input_image',
+                image_url: `data:${input.value.mimeType};base64,${input.value.imageBase64}`,
+                detail: 'high',
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'toy_shelf_analysis',
+            strict: true,
+            schema: responseSchema,
+          },
+        },
+      }),
+    });
+  } catch (error) {
+    console.error('OpenAI request failed before receiving a response.', safeError(error));
+    return jsonResponse({ error: 'Analysis provider is unavailable.' }, 502);
+  }
+
+  if (!openAIResponse.ok) {
+    console.error('OpenAI returned an error.', {
+      status: openAIResponse.status,
+      requestId: openAIResponse.headers.get('x-request-id'),
+    });
+    return jsonResponse({ error: 'Analysis provider request failed.' }, 502);
+  }
+
+  let openAIResponseBody: unknown;
+
+  try {
+    openAIResponseBody = await openAIResponse.json();
+  } catch {
+    console.error('OpenAI returned a non-JSON response.');
+    return jsonResponse({ error: 'Analysis provider returned an invalid response.' }, 502);
+  }
+
+  const outputText = extractOutputText(openAIResponseBody);
+
+  if (!outputText) {
+    console.error('OpenAI response did not contain structured output text.');
+    return jsonResponse({ error: 'Analysis provider returned an invalid response.' }, 502);
+  }
+
+  let modelOutput: unknown;
+
+  try {
+    modelOutput = JSON.parse(outputText);
+  } catch {
+    console.error('OpenAI structured output could not be parsed.');
+    return jsonResponse({ error: 'Analysis provider returned malformed data.' }, 502);
+  }
+
+  const validatedOutput = validateModelOutput(modelOutput);
+
+  if (!validatedOutput.ok) {
+    console.error('OpenAI structured output failed server validation.');
+    return jsonResponse({ error: 'Analysis provider returned malformed data.' }, 502);
+  }
+
+  const semanticToys = validatedOutput.toys.map((toy) => ({
+    id: crypto.randomUUID(),
+    ...toy,
+  }));
+  const localizations = await localizeSemanticToys(
+    semanticToys,
+    input.value,
+  );
+  const localizationByToyId = new Map(
+    localizations.map((localization) => [localization.toyId, localization]),
+  );
+
+  const result: ToyAnalysisResult = {
+    analysisId: '',
+    childAgeMonths: input.value.childAgeMonths,
+    toys: semanticToys.map((toy) => ({
+      ...toy,
+      boundingBox: localizationByToyId.get(toy.id)?.boundingBox ?? null,
+    })),
+  };
+
+  const persistenceResult = await persistAnalysis(result, authentication.userId);
+
+  if (!persistenceResult.ok) {
+    return jsonResponse({ error: 'Analysis could not be saved.' }, 500);
+  }
+
+  result.analysisId = persistenceResult.analysisId;
+
+  return jsonResponse(result, 200);
+});
+
+async function localizeSemanticToys(
+  toys: Array<ModelToy & { id: string }>,
+  input: AnalyzeToyShelfRequest,
+): Promise<ToyLocalization[]> {
+  if (toys.length === 0) {
+    return [];
+  }
+
+  const apiToken = Deno.env.get('REPLICATE_API_TOKEN')?.trim();
+
+  console.info('[toy-analysis] replicate_config', {
+    tokenConfigured: Boolean(apiToken),
+  });
+
+  if (!apiToken) {
+    console.warn('[toy-analysis] localization_missing', {
+      reason: 'provider_not_configured',
+      toyCount: toys.length,
+    });
+    return [];
+  }
+
+  const configuredDebugQuery = Deno.env.get('GROUNDING_DINO_DEBUG_QUERY')?.trim();
+  const toyQueries: ToyLocalizationQuery[] = configuredDebugQuery
+    ? [{ toyId: toys[0].id, query: configuredDebugQuery }]
+    : toys.map((toy) => ({
+        toyId: toy.id,
+        query: createLocalizationQuery(toy),
+      }));
+
+  console.info('[toy-analysis] localization_started', {
+    toyCount: toys.length,
+    queryCount: toyQueries.length,
+  });
+
+  try {
+    const provider = new ReplicateGroundingDinoProvider(apiToken);
+    const localizations = await provider.localizeToys({
+      imageDataUrl: `data:${input.mimeType};base64,${input.imageBase64}`,
+      imageWidth: input.imageWidth,
+      imageHeight: input.imageHeight,
+      toyQueries,
+    });
+    const localizationByToyId = new Map(
+      localizations.map((localization) => [localization.toyId, localization]),
+    );
+
+    for (const toy of toys) {
+      const localization = localizationByToyId.get(toy.id);
+
+      if (localization) {
+        console.info('[toy-analysis] localization_result', {
+          toyName: toy.name,
+          query: localization.query,
+          detectionsReturned: localizations.length,
+          detectorConfidence: localization.confidence,
+          accepted: true,
+          normalizedBoundingBox: localization.boundingBox,
+        });
+      } else {
+        console.info('[toy-analysis] localization_missing', {
+          toyName: toy.name,
+          query: toyQueries.find((item) => item.toyId === toy.id)?.query,
+          detectionsReturned: localizations.length,
+          bestConfidence: null,
+          accepted: false,
+        });
+      }
+    }
+
+    console.info('[toy-analysis] localization_completed', {
+      toyCount: toys.length,
+      localizedCount: localizations.length,
+    });
+
+    return localizations;
+  } catch (error) {
+    console.warn('[toy-analysis] localization_completed', {
+      toyCount: toys.length,
+      localizedCount: 0,
+      error: safeError(error),
+    });
+    return [];
+  }
+}
+
+function createLocalizationQuery(toy: ModelToy): string {
+  const name = toy.name.replace(/[,.;]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const category = toy.category
+    ?.replace(/[,.;]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const combined = category && !name.toLowerCase().includes(category.toLowerCase())
+    ? `${name} ${category}`
+    : name;
+
+  return /\b(toy|plush|figure|doll|blocks?|puzzle|vehicle|car|truck)\b/i.test(combined)
+    ? combined
+    : `${combined} toy`;
+}
+
+type CandidateModelResult = {
+  candidateId: string;
+  isToy: boolean;
+  name: string | null;
+  category: string | null;
+  recommendation: Recommendation | null;
+  reason: string | null;
+  confidence: number | null;
+  playIdeas: PlayIdea[];
+};
+
+async function analyzeDetectedCandidates(
+  input: AnalyzeDetectedCandidatesRequest,
+  userId: string,
+  apiKey: string,
+): Promise<Response> {
+  const candidateIds = input.candidateImages.map((candidate) => candidate.candidateId);
+  const content: Array<Record<string, unknown>> = [
+    {
+      type: 'input_text',
+      text: `The child is ${input.childAgeMonths} months old. Analyze exactly the ${candidateIds.length} supplied candidate crops. Return exactly one result for every supplied candidateId and no other IDs.`,
+    },
+  ];
+  for (const candidate of input.candidateImages) {
+    content.push(
+      { type: 'input_text', text: `candidateId: ${candidate.candidateId}` },
+      {
+        type: 'input_image',
+        image_url: `data:image/jpeg;base64,${candidate.imageBase64}`,
+        detail: 'low',
+      },
+    );
+  }
+
+  console.info('[toy-analysis] semantic_batch_started', {
+    candidateCount: candidateIds.length,
+    candidateIds,
+  });
+  const startedAt = Date.now();
+  let response: Response;
+  try {
+    response = await fetch(OPENAI_RESPONSES_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        store: false,
+        max_output_tokens: 4000,
+        input: [
+          {
+            role: 'developer',
+            content: [{ type: 'input_text', text: candidateSemanticInstructions }],
+          },
+          { role: 'user', content },
+        ],
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'candidate_semantic_analysis',
+            strict: true,
+            schema: candidateSemanticSchema(candidateIds),
+          },
+        },
+      }),
+    });
+  } catch (error) {
+    console.warn('[toy-analysis] semantic_batch_completed', {
+      candidateCount: candidateIds.length,
+      latencyMs: Date.now() - startedAt,
+      error: safeError(error),
+    });
+    return jsonResponse({ error: 'Analysis provider is unavailable.' }, 502);
+  }
+
+  if (!response.ok) {
+    console.warn('[toy-analysis] semantic_batch_completed', {
+      candidateCount: candidateIds.length,
+      latencyMs: Date.now() - startedAt,
+      status: response.status,
+      requestId: response.headers.get('x-request-id'),
+    });
+    return jsonResponse({ error: 'Analysis provider request failed.' }, 502);
+  }
+
+  let responseBody: unknown;
+  try {
+    responseBody = await response.json();
+  } catch {
+    return jsonResponse({ error: 'Analysis provider returned an invalid response.' }, 502);
+  }
+  const outputText = extractOutputText(responseBody);
+  if (!outputText) {
+    return jsonResponse({ error: 'Analysis provider returned an invalid response.' }, 502);
+  }
+
+  let rawOutput: unknown;
+  try {
+    rawOutput = JSON.parse(outputText);
+  } catch {
+    return jsonResponse({ error: 'Analysis provider returned malformed data.' }, 502);
+  }
+  const semantic = validateCandidateSemanticOutput(rawOutput, candidateIds);
+  if (!semantic.ok) {
+    return jsonResponse({ error: 'Analysis provider returned malformed data.' }, 502);
+  }
+
+  const usage = extractUsage(responseBody);
+  for (const candidate of semantic.candidates) {
+    console.info('[toy-analysis] semantic_candidate_result', {
+      candidateId: candidate.candidateId,
+      isToy: candidate.isToy,
+      name: candidate.name,
+      recommendation: candidate.recommendation,
+      confidence: candidate.confidence,
+      playIdeaCount: candidate.playIdeas.length,
+    });
+  }
+  const rejectedCandidateIds = semantic.candidates
+    .filter((candidate) => !candidate.isToy)
+    .map((candidate) => candidate.candidateId);
+  console.info('[toy-analysis] semantic_filter_completed', {
+    suppliedCandidateCount: candidateIds.length,
+    acceptedToyCount: semantic.candidates.filter((candidate) => candidate.isToy).length,
+    rejectedCandidateIds,
+  });
+  console.info('[toy-analysis] semantic_batch_completed', {
+    candidateCount: candidateIds.length,
+    acceptedToyCount: semantic.candidates.filter((candidate) => candidate.isToy).length,
+    latencyMs: Date.now() - startedAt,
+    usage,
+  });
+
+  const result: ToyAnalysisResult = {
+    analysisId: '',
+    childAgeMonths: input.childAgeMonths,
+    toys: semantic.candidates
+      .filter((candidate): candidate is CandidateModelResult & {
+        isToy: true;
+        name: string;
+        recommendation: Recommendation;
+        reason: string;
+      } => candidate.isToy)
+      .map((candidate) => ({
+        id: crypto.randomUUID(),
+        candidateId: candidate.candidateId,
+        name: candidate.name,
+        category: candidate.category,
+        recommendation: candidate.recommendation,
+        reason: candidate.reason,
+        confidence: candidate.confidence,
+        playIdeas: candidate.playIdeas,
+        boundingBox: null,
+      })),
+  };
+  const persistence = await persistAnalysis(result, userId);
+  if (!persistence.ok) {
+    return jsonResponse({ error: 'Analysis could not be saved.' }, 500);
+  }
+  result.analysisId = persistence.analysisId;
+  return jsonResponse({ ...result, usage }, 200);
+}
+
+const candidateSemanticInstructions = `
+You analyze only the supplied candidate crop images. They have already been selected
+by a toy-focused object detector. The detector has defined the complete candidate
+inventory; do not search for additional objects or infer objects outside these crops.
+
+Treat a candidate as a toy when it reasonably appears to contain a toy, toy figure,
+animal figure, plush or stuffed toy, doll, toy vehicle, block or construction toy,
+puzzle piece or toy, interactive toy, or a recognizable part of a toy. A candidate
+does not need to be perfectly framed or completely visible. Partial visibility,
+cropped legs, ears, or wheels, occlusion, an unusual viewing angle, or uncertainty
+about the exact product identity are not sufficient reasons to set isToy to false.
+
+If a candidate clearly appears toy-like but its exact identity is uncertain, set
+isToy to true, use a cautious generic name such as "plastic animal figure", "soft
+toy dog", "small toy vehicle", or "toy figure", and lower semantic confidence when
+appropriate. Use isToy false only when the visible candidate clearly appears to be a
+non-toy object such as furniture, wall or background, a container or basket with no
+toy as the actual candidate, a household object, clothing, or another unrelated
+object. When uncertain between a partially visible toy and a non-toy, prefer the toy
+classification only when there is reasonable visual evidence of a toy. Do not
+hallucinate a specific brand or character merely to avoid rejection.
+
+For every supplied candidateId, decide whether the crop represents a toy. If isToy
+is false, return null for name, category, recommendation, reason, and confidence,
+and return an empty playIdeas array. If isToy is true, return a cautious useful
+name, category or null, exactly one KEEP/ROTATE/PASS_ON recommendation, a concise
+parent-friendly reason, and confidence from 0 to 1 or null. Use a brand or licensed
+character only when clearly recognizable; otherwise use a generic visual name.
+
+For KEEP, return exactly 2 or 3 short practical play ideas appropriate for the
+supplied child age that use that toy and require no purchase. For ROTATE and
+PASS_ON, return an empty playIdeas array. Never recommend disposal based on an
+unsupported assumption.
+`.trim();
+
+function candidateSemanticSchema(candidateIds: string[]): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      candidates: {
+        type: 'array',
+        minItems: candidateIds.length,
+        maxItems: candidateIds.length,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            candidateId: { type: 'string', enum: candidateIds },
+            isToy: { type: 'boolean' },
+            name: { type: ['string', 'null'] },
+            category: { type: ['string', 'null'] },
+            recommendation: {
+              type: ['string', 'null'],
+              enum: ['KEEP', 'ROTATE', 'PASS_ON', null],
+            },
+            reason: { type: ['string', 'null'] },
+            confidence: { type: ['number', 'null'], minimum: 0, maximum: 1 },
+            playIdeas: {
+              type: 'array',
+              maxItems: 3,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  title: { type: 'string' },
+                  description: { type: 'string' },
+                },
+                required: ['title', 'description'],
+              },
+            },
+          },
+          required: [
+            'candidateId', 'isToy', 'name', 'category', 'recommendation',
+            'reason', 'confidence', 'playIdeas',
+          ],
+        },
+      },
+    },
+    required: ['candidates'],
+  };
+}
+
+function validateCandidateSemanticOutput(
+  value: unknown,
+  expectedIds: string[],
+): { ok: true; candidates: CandidateModelResult[] } | { ok: false } {
+  if (!isRecord(value) || !Array.isArray(value.candidates) || value.candidates.length !== expectedIds.length) {
+    return { ok: false };
+  }
+  const expected = new Set(expectedIds);
+  const byId = new Map<string, CandidateModelResult>();
+  for (const raw of value.candidates) {
+    const parsed = validateCandidateSemanticItem(raw);
+    if (!parsed || !expected.has(parsed.candidateId) || byId.has(parsed.candidateId)) {
+      return { ok: false };
+    }
+    byId.set(parsed.candidateId, parsed);
+  }
+  if (byId.size !== expected.size) {
+    return { ok: false };
+  }
+  return { ok: true, candidates: expectedIds.map((id) => byId.get(id)!) };
+}
+
+function validateCandidateSemanticItem(value: unknown): CandidateModelResult | null {
+  if (!isRecord(value) || typeof value.candidateId !== 'string' || typeof value.isToy !== 'boolean') {
+    return null;
+  }
+  const candidateId = value.candidateId.trim();
+  if (!candidateId) return null;
+  if (!value.isToy) {
+    if (
+      value.name !== null || value.category !== null || value.recommendation !== null ||
+      value.reason !== null || value.confidence !== null ||
+      !Array.isArray(value.playIdeas) || value.playIdeas.length !== 0
+    ) return null;
+    return { candidateId, isToy: false, name: null, category: null, recommendation: null, reason: null, confidence: null, playIdeas: [] };
+  }
+  const name = typeof value.name === 'string' ? value.name.trim() : '';
+  const reason = typeof value.reason === 'string' ? value.reason.trim() : '';
+  const category = value.category === null ? null : typeof value.category === 'string' && value.category.trim() ? value.category.trim() : undefined;
+  const confidence = value.confidence;
+  if (
+    !name || !reason || category === undefined || !isRecommendation(value.recommendation) ||
+    !(confidence === null || (typeof confidence === 'number' && Number.isFinite(confidence) && confidence >= 0 && confidence <= 1))
+  ) return null;
+  const playIdeas = validatePlayIdeas(value.playIdeas, value.recommendation);
+  if (!playIdeas) return null;
+  return { candidateId, isToy: true, name, category, recommendation: value.recommendation, reason, confidence, playIdeas };
+}
+
+function extractUsage(value: unknown): { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null } {
+  const usage = isRecord(value) && isRecord(value.usage) ? value.usage : null;
+  return {
+    inputTokens: usage && typeof usage.input_tokens === 'number' ? usage.input_tokens : null,
+    outputTokens: usage && typeof usage.output_tokens === 'number' ? usage.output_tokens : null,
+    totalTokens: usage && typeof usage.total_tokens === 'number' ? usage.total_tokens : null,
+  };
+}
+
+type PersistenceResult =
+  | { ok: true; analysisId: string }
+  | { ok: false };
+
+async function persistAnalysis(
+  result: ToyAnalysisResult,
+  userId: string,
+): Promise<PersistenceResult> {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')?.trim();
+  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')?.trim();
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    console.error('Analysis persistence is missing required Supabase server configuration.', {
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      serviceRoleKeyConfigured: Boolean(serviceRoleKey),
+    });
+    return { ok: false };
+  }
+
+  const supabase = createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+  const { data: analysis, error: analysisError } = await supabase
+    .from('toy_analyses')
+    .insert({
+      child_age_months: result.childAgeMonths,
+      image_path: null,
+      status: 'completed',
+      user_id: userId,
+    })
+    .select('id')
+    .single();
+
+  if (analysisError || !analysis?.id) {
+    console.error('Failed to persist toy analysis.', safeDatabaseError(analysisError));
+    return { ok: false };
+  }
+
+  const analysisId = analysis.id as string;
+
+  if (result.toys.length === 0) {
+    return { ok: true, analysisId };
+  }
+
+  const { error: itemsError } = await supabase.from('toy_analysis_items').insert(
+    result.toys.map((toy) => ({
+      id: toy.id,
+      analysis_id: analysisId,
+      name: toy.name,
+      category: toy.category,
+      recommendation: toy.recommendation,
+      reason: toy.reason,
+      confidence: toy.confidence,
+      play_ideas: toy.playIdeas,
+    })),
+  );
+
+  if (!itemsError) {
+    return { ok: true, analysisId };
+  }
+
+  console.error('Failed to persist toy analysis items.', safeDatabaseError(itemsError));
+
+  const { error: cleanupError } = await supabase
+    .from('toy_analyses')
+    .delete()
+    .eq('id', analysisId);
+
+  if (cleanupError) {
+    console.error('Failed to clean up incomplete toy analysis.', {
+      analysisId,
+      error: safeDatabaseError(cleanupError),
+    });
+
+    const { error: markFailedError } = await supabase
+      .from('toy_analyses')
+      .update({ status: 'failed' })
+      .eq('id', analysisId);
+
+    if (markFailedError) {
+      console.error('Failed to mark incomplete toy analysis as failed.', {
+        analysisId,
+        error: safeDatabaseError(markFailedError),
+      });
+    }
+  }
+
+  return { ok: false };
+}
+
+type AuthenticationResult =
+  | { ok: true; userId: string }
+  | { ok: false; status: 401 | 500 };
+
+async function authenticateRequest(request: Request): Promise<AuthenticationResult> {
+  const authorization = request.headers.get('Authorization')?.trim();
+
+  if (!authorization?.startsWith('Bearer ')) {
+    return { ok: false, status: 401 };
+  }
+
+  const accessToken = authorization.slice('Bearer '.length).trim();
+
+  if (!accessToken) {
+    return { ok: false, status: 401 };
+  }
+
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')?.trim();
+  const anonKey = Deno.env.get('SUPABASE_ANON_KEY')?.trim();
+
+  if (!supabaseUrl || !anonKey) {
+    console.error('Authentication is missing required Supabase server configuration.', {
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      anonKeyConfigured: Boolean(anonKey),
+    });
+    return { ok: false, status: 500 };
+  }
+
+  const authClient = createClient(supabaseUrl, anonKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+  const { data, error } = await authClient.auth.getUser(accessToken);
+
+  if (error || !data.user?.id) {
+    console.warn('Toy analysis request authentication failed.', {
+      error: error ? safeDatabaseError(error) : undefined,
+    });
+    return { ok: false, status: 401 };
+  }
+
+  return { ok: true, userId: data.user.id };
+}
+
+type RequestValidation =
+  | { ok: true; value: AnalyzeToyShelfRequest | AnalyzeDetectedCandidatesRequest }
+  | { ok: false; error: string };
+
+function validateRequest(value: unknown): RequestValidation {
+  if (!isRecord(value)) {
+    return { ok: false, error: 'Request body must be a JSON object.' };
+  }
+
+  if ('user_id' in value || 'userId' in value) {
+    return { ok: false, error: 'User ownership is derived from authentication.' };
+  }
+
+  if (value.mode === 'detected-candidates') {
+    return validateDetectedCandidatesRequest(value);
+  }
+
+  if (typeof value.imageBase64 !== 'string' || value.imageBase64.trim() === '') {
+    return { ok: false, error: 'imageBase64 is required.' };
+  }
+
+  if (!isSupportedMimeType(value.mimeType)) {
+    return { ok: false, error: 'mimeType must be image/jpeg, image/png, or image/webp.' };
+  }
+
+  if (!Number.isInteger(value.childAgeMonths) || Number(value.childAgeMonths) <= 0) {
+    return { ok: false, error: 'childAgeMonths must be a positive integer.' };
+  }
+
+  if (
+    !Number.isInteger(value.imageWidth) ||
+    Number(value.imageWidth) <= 0 ||
+    !Number.isInteger(value.imageHeight) ||
+    Number(value.imageHeight) <= 0
+  ) {
+    return { ok: false, error: 'imageWidth and imageHeight must be positive integers.' };
+  }
+
+  return {
+    ok: true,
+    value: {
+      imageBase64: value.imageBase64.trim(),
+      mimeType: value.mimeType,
+      childAgeMonths: Number(value.childAgeMonths),
+      imageWidth: Number(value.imageWidth),
+      imageHeight: Number(value.imageHeight),
+    },
+  };
+}
+
+function validateDetectedCandidatesRequest(
+  value: Record<string, unknown>,
+): RequestValidation {
+  if (!Number.isInteger(value.childAgeMonths) || Number(value.childAgeMonths) <= 0) {
+    return { ok: false, error: 'childAgeMonths must be a positive integer.' };
+  }
+
+  if (
+    !Array.isArray(value.candidateImages) ||
+    value.candidateImages.length === 0 ||
+    value.candidateImages.length > MAX_TOY_ITEMS
+  ) {
+    return { ok: false, error: `candidateImages must contain 1 to ${MAX_TOY_ITEMS} items.` };
+  }
+
+  const ids = new Set<string>();
+  const candidateImages: CandidateSemanticImage[] = [];
+  for (const candidate of value.candidateImages) {
+    if (!isRecord(candidate)) {
+      return { ok: false, error: 'Each candidate image must be an object.' };
+    }
+    const candidateId = typeof candidate.candidateId === 'string'
+      ? candidate.candidateId.trim()
+      : '';
+    const imageBase64 = typeof candidate.imageBase64 === 'string'
+      ? candidate.imageBase64.trim()
+      : '';
+    if (
+      !candidateId ||
+      ids.has(candidateId) ||
+      !imageBase64 ||
+      candidate.mimeType !== 'image/jpeg'
+    ) {
+      return { ok: false, error: 'Candidate IDs and JPEG images must be valid and unique.' };
+    }
+    ids.add(candidateId);
+    candidateImages.push({ candidateId, imageBase64, mimeType: 'image/jpeg' });
+  }
+
+  return {
+    ok: true,
+    value: {
+      mode: 'detected-candidates',
+      childAgeMonths: Number(value.childAgeMonths),
+      candidateImages,
+    },
+  };
+}
+
+function isSupportedMimeType(value: unknown): value is SupportedMimeType {
+  return typeof value === 'string' && supportedMimeTypes.has(value as SupportedMimeType);
+}
+
+function validateModelOutput(
+  value: unknown,
+): { ok: true; toys: ModelToy[] } | { ok: false } {
+  if (!isRecord(value) || !Array.isArray(value.toys)) {
+    return { ok: false };
+  }
+
+  if (value.toys.length > MAX_TOY_ITEMS) {
+    return { ok: false };
+  }
+
+  const toys: ModelToy[] = [];
+
+  for (const toy of value.toys) {
+    if (!isRecord(toy)) {
+      return { ok: false };
+    }
+
+    const name = typeof toy.name === 'string' ? toy.name.trim() : '';
+    const reason = typeof toy.reason === 'string' ? toy.reason.trim() : '';
+    const category = toy.category === null
+      ? null
+      : typeof toy.category === 'string' && toy.category.trim()
+        ? toy.category.trim()
+        : undefined;
+    const confidence = toy.confidence;
+    const recommendation = toy.recommendation;
+
+    if (
+      !name ||
+      !reason ||
+      category === undefined ||
+      !isRecommendation(recommendation) ||
+      !(
+        confidence === null ||
+        (typeof confidence === 'number' &&
+          Number.isFinite(confidence) &&
+          confidence >= 0 &&
+          confidence <= 1)
+      )
+    ) {
+      return { ok: false };
+    }
+
+    const playIdeas = validatePlayIdeas(toy.playIdeas, recommendation);
+
+    if (!playIdeas) {
+      return { ok: false };
+    }
+
+    toys.push({
+      name,
+      category,
+      recommendation,
+      reason,
+      confidence,
+      playIdeas,
+    });
+  }
+
+  return { ok: true, toys };
+}
+
+function validatePlayIdeas(
+  value: unknown,
+  recommendation: Recommendation,
+): PlayIdea[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  if (
+    (recommendation === 'KEEP' && (value.length < 2 || value.length > 3)) ||
+    (recommendation !== 'KEEP' && value.length !== 0)
+  ) {
+    return null;
+  }
+
+  const playIdeas: PlayIdea[] = [];
+
+  for (const idea of value) {
+    if (!isRecord(idea)) {
+      return null;
+    }
+
+    const keys = Object.keys(idea);
+    const title = typeof idea.title === 'string' ? idea.title.trim() : '';
+    const description =
+      typeof idea.description === 'string' ? idea.description.trim() : '';
+
+    if (
+      keys.length !== 2 ||
+      !keys.includes('title') ||
+      !keys.includes('description') ||
+      !title ||
+      !description
+    ) {
+      return null;
+    }
+
+    playIdeas.push({ title, description });
+  }
+
+  return playIdeas;
+}
+
+function isRecommendation(value: unknown): value is Recommendation {
+  return value === 'KEEP' || value === 'ROTATE' || value === 'PASS_ON';
+}
+
+function extractOutputText(value: unknown): string | null {
+  if (!isRecord(value) || !Array.isArray(value.output)) {
+    return null;
+  }
+
+  for (const item of value.output) {
+    if (!isRecord(item) || !Array.isArray(item.content)) {
+      continue;
+    }
+
+    for (const content of item.content) {
+      if (
+        isRecord(content) &&
+        content.type === 'output_text' &&
+        typeof content.text === 'string'
+      ) {
+        return content.text;
+      }
+    }
+  }
+
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function safeError(error: unknown): { name: string; message: string } {
+  return error instanceof Error
+    ? { name: error.name, message: error.message }
+    : { name: 'UnknownError', message: 'Unknown network error' };
+}
+
+function safeDatabaseError(error: unknown): {
+  name: string;
+  message: string;
+  code?: string;
+} {
+  if (!isRecord(error)) {
+    return { name: 'UnknownDatabaseError', message: 'Unknown database error' };
+  }
+
+  return {
+    name: typeof error.name === 'string' ? error.name : 'DatabaseError',
+    message: typeof error.message === 'string' ? error.message : 'Database request failed',
+    code: typeof error.code === 'string' ? error.code : undefined,
+  };
+}
+
+function jsonResponse(
+  body: unknown,
+  status: number,
+  additionalHeaders: Record<string, string> = {},
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...corsHeaders,
+      ...additionalHeaders,
+      'Content-Type': 'application/json',
+    },
+  });
+}
