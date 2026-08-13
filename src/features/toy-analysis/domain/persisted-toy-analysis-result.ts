@@ -54,12 +54,19 @@ function parsePersistedToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
         : undefined;
   const confidence = value.confidence;
   const recommendation = value.recommendation;
+  const imagePath =
+    value.imagePath === null
+      ? null
+      : typeof value.imagePath === 'string' && value.imagePath.trim()
+        ? value.imagePath.trim()
+        : undefined;
 
   if (
     !id ||
     !name ||
     !reason ||
     category === undefined ||
+    imagePath === undefined ||
     !isToyRecommendation(recommendation) ||
     !(
       confidence === null ||
@@ -87,6 +94,7 @@ function parsePersistedToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
     confidence,
     playIdeas,
     boundingBox: null,
+    imagePath,
   };
 }
 

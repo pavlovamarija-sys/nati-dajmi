@@ -1,6 +1,8 @@
 // @ts-ignore Deno resolves npm: specifiers when the Edge Function is bundled.
 import { createClient } from 'npm:@supabase/supabase-js@2.112.2';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { isValidCropRegistrationPath, TOY_IMAGE_BUCKET, type CropRegistrationInput } from './crop-registration.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import type { ToyLocalization, ToyLocalizationQuery } from './localization.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import { ReplicateGroundingDinoProvider } from './replicate-grounding-dino.ts';
@@ -27,6 +29,10 @@ type AnalyzeDetectedCandidatesRequest = {
   mode: 'detected-candidates';
   childAgeMonths: number;
   candidateImages: CandidateSemanticImage[];
+};
+
+type RegisterCropRequest = CropRegistrationInput & {
+  mode: 'register-crop';
 };
 
 type PlayIdea = {
@@ -226,6 +232,13 @@ Deno.serve(async (request) => {
 
   if (!input.ok) {
     return jsonResponse({ error: input.error }, 400);
+  }
+
+  if (input.value.mode === 'register-crop') {
+    return registerCropImage(
+      input.value,
+      authentication.userId,
+    );
   }
 
   const apiKey = Deno.env.get('OPENAI_API_KEY')?.trim();
@@ -770,6 +783,116 @@ function extractUsage(value: unknown): { inputTokens: number | null; outputToken
   };
 }
 
+async function registerCropImage(
+  input: RegisterCropRequest,
+  authenticatedUserId: string,
+): Promise<Response> {
+  if (!isValidCropRegistrationPath(authenticatedUserId, input)) {
+    return jsonResponse({ error: 'Crop image path is invalid.' }, 400);
+  }
+
+  const supabase = createServerSupabaseClient();
+  if (!supabase) {
+    return jsonResponse({ error: 'Crop registration service is not configured.' }, 500);
+  }
+
+  const { data: analysis, error: analysisError } = await supabase
+    .from('toy_analyses')
+    .select('id')
+    .eq('id', input.analysisId)
+    .eq('user_id', authenticatedUserId)
+    .maybeSingle();
+
+  if (analysisError) {
+    console.error('[toy-analysis] crop_registration_failed', {
+      stage: 'analysis_ownership',
+      error: safeDatabaseError(analysisError),
+    });
+    return jsonResponse({ error: 'Crop image could not be registered.' }, 500);
+  }
+
+  if (!analysis) {
+    return jsonResponse({ error: 'Analysis is unavailable.' }, 404);
+  }
+
+  const { data: toyItem, error: toyItemError } = await supabase
+    .from('toy_analysis_items')
+    .select('id')
+    .eq('id', input.toyItemId)
+    .eq('analysis_id', input.analysisId)
+    .maybeSingle();
+
+  if (toyItemError) {
+    console.error('[toy-analysis] crop_registration_failed', {
+      stage: 'toy_item_ownership',
+      error: safeDatabaseError(toyItemError),
+    });
+    return jsonResponse({ error: 'Crop image could not be registered.' }, 500);
+  }
+
+  if (!toyItem) {
+    return jsonResponse({ error: 'Toy item is unavailable.' }, 404);
+  }
+
+  const folder = `${authenticatedUserId}/${input.analysisId}`;
+  const fileName = `${input.toyItemId}.jpg`;
+  const { data: objects, error: objectError } = await supabase.storage
+    .from(TOY_IMAGE_BUCKET)
+    .list(folder, { limit: 10, search: fileName });
+
+  if (objectError) {
+    console.error('[toy-analysis] crop_registration_failed', {
+      stage: 'object_lookup',
+      error: safeDatabaseError(objectError),
+    });
+    return jsonResponse({ error: 'Crop image could not be registered.' }, 500);
+  }
+
+  if (!objects?.some((object: { name: string }) => object.name === fileName)) {
+    return jsonResponse({ error: 'Crop image does not exist.' }, 404);
+  }
+
+  const { error: updateError } = await supabase
+    .from('toy_analysis_items')
+    .update({ image_path: input.imagePath })
+    .eq('id', input.toyItemId)
+    .eq('analysis_id', input.analysisId);
+
+  if (updateError) {
+    console.error('[toy-analysis] crop_registration_failed', {
+      stage: 'image_path_update',
+      error: safeDatabaseError(updateError),
+    });
+    return jsonResponse({ error: 'Crop image could not be registered.' }, 500);
+  }
+
+  console.info('[toy-analysis] crop_registration_completed', {
+    analysisId: input.analysisId,
+    toyItemId: input.toyItemId,
+  });
+  return jsonResponse({ registered: true }, 200);
+}
+
+function createServerSupabaseClient(): ReturnType<typeof createClient> | null {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')?.trim();
+  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')?.trim();
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    console.error('Server-side Supabase configuration is missing.', {
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      serviceRoleKeyConfigured: Boolean(serviceRoleKey),
+    });
+    return null;
+  }
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
+
 type PersistenceResult =
   | { ok: true; analysisId: string }
   | { ok: false };
@@ -910,7 +1033,10 @@ async function authenticateRequest(request: Request): Promise<AuthenticationResu
 }
 
 type RequestValidation =
-  | { ok: true; value: AnalyzeToyShelfRequest | AnalyzeDetectedCandidatesRequest }
+  | {
+      ok: true;
+      value: AnalyzeToyShelfRequest | AnalyzeDetectedCandidatesRequest | RegisterCropRequest;
+    }
   | { ok: false; error: string };
 
 function validateRequest(value: unknown): RequestValidation {
@@ -920,6 +1046,10 @@ function validateRequest(value: unknown): RequestValidation {
 
   if ('user_id' in value || 'userId' in value) {
     return { ok: false, error: 'User ownership is derived from authentication.' };
+  }
+
+  if (value.mode === 'register-crop') {
+    return validateRegisterCropRequest(value);
   }
 
   if (value.mode === 'detected-candidates') {
@@ -955,6 +1085,26 @@ function validateRequest(value: unknown): RequestValidation {
       childAgeMonths: Number(value.childAgeMonths),
       imageWidth: Number(value.imageWidth),
       imageHeight: Number(value.imageHeight),
+    },
+  };
+}
+
+function validateRegisterCropRequest(value: Record<string, unknown>): RequestValidation {
+  const analysisId = readNonblankString(value.analysisId);
+  const toyItemId = readNonblankString(value.toyItemId);
+  const imagePath = readNonblankString(value.imagePath);
+
+  if (!analysisId || !toyItemId || !imagePath) {
+    return { ok: false, error: 'analysisId, toyItemId, and imagePath are required.' };
+  }
+
+  return {
+    ok: true,
+    value: {
+      mode: 'register-crop',
+      analysisId,
+      toyItemId,
+      imagePath,
     },
   };
 }
@@ -1148,6 +1298,10 @@ function extractOutputText(value: unknown): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readNonblankString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
 function safeError(error: unknown): { name: string; message: string } {

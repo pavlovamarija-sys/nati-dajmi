@@ -24,6 +24,7 @@ const ANALYSIS_SELECT = `
     reason,
     confidence,
     play_ideas,
+    image_path,
     created_at
   )
 `;
@@ -77,7 +78,7 @@ export async function getToyAnalysisById(
     throw new Error('The persisted toy analysis contains malformed data.');
   }
 
-  return result;
+  return addSignedToyImageUrls(result);
 }
 
 function parseHistoryItem(value: unknown): ToyAnalysisHistoryItem {
@@ -168,8 +169,48 @@ function mapPersistedItem(value: unknown): {
       reason: value.reason,
       confidence: value.confidence,
       playIdeas: value.play_ideas,
+      imagePath: value.image_path,
     },
   };
+}
+
+const SIGNED_IMAGE_URL_LIFETIME_SECONDS = 30 * 60;
+
+async function addSignedToyImageUrls(
+  result: ToyAnalysisResult,
+): Promise<ToyAnalysisResult> {
+  const toys = await Promise.all(
+    result.toys.map(async (toy) => {
+      if (!toy.imagePath) {
+        return toy;
+      }
+
+      const { data, error } = await supabase.storage
+        .from('toy-shelf-images')
+        .createSignedUrl(toy.imagePath, SIGNED_IMAGE_URL_LIFETIME_SECONDS);
+
+      if (error || !data?.signedUrl) {
+        logSignedUrlFailure(toy.id, error);
+        return toy;
+      }
+
+      return { ...toy, imageUri: data.signedUrl };
+    }),
+  );
+
+  return { ...result, toys };
+}
+
+function logSignedUrlFailure(toyItemId: string, error: unknown): void {
+  if (!__DEV__) {
+    return;
+  }
+
+  console.warn('[toy-analysis] signed_crop_url_failed', {
+    toyItemId,
+    errorName: error instanceof Error ? error.name : undefined,
+    errorMessage: error instanceof Error ? error.message : undefined,
+  });
 }
 
 function isValidItemReference(value: unknown): boolean {

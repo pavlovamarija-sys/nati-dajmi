@@ -10,6 +10,7 @@ import {
   isLocalDetectorConfigured,
 } from '@/features/toy-analysis/services/detect-toy-candidates';
 import { prepareCanonicalAnalysisImage } from '@/features/toy-analysis/services/prepare-analysis-image';
+import { persistToyCropImages } from '@/features/toy-analysis/services/upload-toy-crops';
 import type {
   SupportedImageMimeType,
   LocalToyCandidateImage,
@@ -182,7 +183,45 @@ async function analyzeWithLocalDetector(
   if (!result || result.childAgeMonths !== childAgeMonths) {
     throw new ToyAnalysisServiceError('invalid-response');
   }
+
+  await persistAcceptedToyCrops(result);
   return result;
+}
+
+async function persistAcceptedToyCrops(result: ToyAnalysisResult): Promise<void> {
+  const crops = result.toys.flatMap((toy) =>
+    toy.imageUri ? [{ toyItemId: toy.id, imageUri: toy.imageUri }] : [],
+  );
+
+  if (crops.length === 0) {
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user?.id) {
+      logDevelopmentEvent('crop_persistence_skipped', {
+        reason: 'authenticated_user_unavailable',
+      }, 'warn');
+      return;
+    }
+
+    const persistence = await persistToyCropImages(
+      data.user.id,
+      result.analysisId,
+      crops,
+    );
+    logDevelopmentEvent('crop_persistence_summary', {
+      attemptedCount: crops.length,
+      persistedCount: persistence.persistedToyItemIds.length,
+      failedCount: persistence.failedToyItemIds.length,
+    });
+  } catch (error) {
+    logDevelopmentEvent('crop_persistence_failed', {
+      stage: 'finalization',
+      error: getSafeErrorMetadata(error),
+    }, 'warn');
+  }
 }
 
 function parseLocalSemanticResult(

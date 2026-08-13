@@ -55,6 +55,7 @@ export type ToyAnalysisItem = {
   confidence: number | null;
   playIdeas: PlayIdea[];
   boundingBox: ToyBoundingBox | null;
+  imagePath?: string | null;
   imageUri?: string;
 };
 
