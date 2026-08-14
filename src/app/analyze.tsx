@@ -45,11 +45,11 @@ export default function AnalyzeToyShelfScreen() {
       setImage(result.image);
     } else if (result.status === 'permission-denied') {
       Alert.alert(
-        'Camera permission needed',
-        'Allow camera access in your device settings to take a toy shelf photo.',
+        'Потребна е дозвола за камера',
+        'Дозволи пристап до камерата во поставките на уредот за да ги сликаш играчките.',
       );
     } else if (result.status === 'error') {
-      Alert.alert('Could not add photo', 'Please try again.');
+      Alert.alert('Не можевме да ја додадеме фотографијата', 'Обиди се повторно.');
     }
   };
 
@@ -75,8 +75,8 @@ export default function AnalyzeToyShelfScreen() {
       router.push('/results');
     } catch {
       Alert.alert(
-        'Analysis unavailable',
-        "We couldn't analyze this photo. Please try again.",
+        'Анализата не е достапна',
+        'Не можевме да ја анализираме фотографијата. Обиди се повторно.',
       );
     } finally {
       setIsAnalyzing(false);
@@ -90,19 +90,19 @@ export default function AnalyzeToyShelfScreen() {
         keyboardShouldPersistTaps="handled"
       >
         <Pressable
-          accessibilityLabel="Go back"
+          accessibilityLabel="Назад"
           accessibilityRole="button"
           hitSlop={12}
           onPress={() => router.back()}
           style={styles.backButton}
         >
-          <Text style={styles.backLabel}>‹ Back</Text>
+          <Text style={styles.backLabel}>‹ Назад</Text>
         </Pressable>
 
         <View style={styles.header}>
-          <Text style={styles.title}>Analyze Toy Shelf</Text>
+          <Text style={styles.title}>Анализирај ги играчките</Text>
           <Text style={styles.subtitle}>
-            Add a photo and your child&apos;s age to get started.
+            Додај фотографија и внеси ја возраста на детето за да започнеш.
           </Text>
         </View>
 
@@ -136,7 +136,7 @@ export default function AnalyzeToyShelfScreen() {
           {isAnalyzing ? (
             <View style={styles.loadingContent}>
               <ActivityIndicator color="#FFFFFF" />
-              <Text style={styles.analyzeButtonLabel}>Looking at the toys...</Text>
+              <Text style={styles.analyzeButtonLabel}>Ги разгледуваме играчките...</Text>
             </View>
           ) : (
             <Text
@@ -145,7 +145,7 @@ export default function AnalyzeToyShelfScreen() {
                 !canAnalyze && styles.analyzeButtonLabelDisabled,
               ]}
             >
-              Analyze Toys
+              Анализирај ги играчките
             </Text>
           )}
         </Pressable>

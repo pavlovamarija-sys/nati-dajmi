@@ -9,9 +9,9 @@ import type {
 } from '@/features/toy-analysis/types/toy-analysis';
 
 const sections: { recommendation: ToyRecommendation; title: string; color: string }[] = [
-  { recommendation: 'KEEP', title: 'KEEP', color: '#2E6B4F' },
-  { recommendation: 'ROTATE', title: 'ROTATE', color: '#A2622D' },
-  { recommendation: 'PASS_ON', title: 'PASS ON', color: '#8A4D51' },
+  { recommendation: 'KEEP', title: 'Задржи', color: '#2E6B4F' },
+  { recommendation: 'ROTATE', title: 'Ротирај', color: '#A2622D' },
+  { recommendation: 'PASS_ON', title: 'Размени', color: '#8A4D51' },
 ];
 
 export default function ResultsScreen() {
@@ -21,14 +21,14 @@ export default function ResultsScreen() {
     return (
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.emptyState}>
-          <Text style={styles.title}>No results yet</Text>
-          <Text style={styles.subtitle}>Analyze a toy shelf to see recommendations.</Text>
+          <Text style={styles.title}>Сè уште нема резултати</Text>
+          <Text style={styles.subtitle}>Анализирај ги играчките за да добиеш препораки.</Text>
           <Pressable
             accessibilityRole="button"
             onPress={() => router.replace('/analyze')}
             style={styles.primaryButton}
           >
-            <Text style={styles.primaryButtonLabel}>Analyze Toy Shelf</Text>
+            <Text style={styles.primaryButtonLabel}>Анализирај ги играчките</Text>
           </Pressable>
         </View>
       </SafeAreaView>
@@ -39,19 +39,19 @@ export default function ResultsScreen() {
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>
         <Pressable
-          accessibilityLabel="Go back"
+          accessibilityLabel="Назад"
           accessibilityRole="button"
           hitSlop={12}
           onPress={() => router.back()}
           style={styles.backButton}
         >
-          <Text style={styles.backLabel}>‹ Back</Text>
+          <Text style={styles.backLabel}>‹ Назад</Text>
         </Pressable>
 
         <View style={styles.header}>
-          <Text style={styles.title}>Toy recommendations</Text>
+          <Text style={styles.title}>Препораки за играчките</Text>
           <Text style={styles.subtitle}>
-            A simple starting point for refreshing the shelf.
+            Едноставен почеток за да одлучиш што да задржиш, ротираш или размениш.
           </Text>
         </View>
 

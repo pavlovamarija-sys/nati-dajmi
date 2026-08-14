@@ -42,13 +42,13 @@ export default function AuthScreen() {
 
         if (result.confirmationRequired) {
           Alert.alert(
-            'Check your email',
-            'Open the confirmation link we sent, then return here to sign in.',
+            'Провери ја е-поштата',
+            'Отвори ја врската за потврда што ти ја испративме, па врати се тука за да се најавиш.',
           );
         }
       }
     } catch (error) {
-      Alert.alert('Could not continue', getParentFriendlyAuthError(error));
+      Alert.alert('Не можевме да продолжиме', getParentFriendlyAuthError(error));
     } finally {
       setPendingAction(null);
     }
@@ -62,15 +62,15 @@ export default function AuthScreen() {
       >
         <View style={styles.container}>
           <View style={styles.header}>
-            <Text style={styles.title}>Welcome</Text>
-            <Text style={styles.subtitle}>Sign in to analyze your child&apos;s toy shelf.</Text>
+            <Text style={styles.title}>Добредојде</Text>
+            <Text style={styles.subtitle}>Најави се за да ги анализираш играчките.</Text>
           </View>
 
           <View style={styles.form}>
             <View style={styles.field}>
-              <Text style={styles.label}>Email</Text>
+              <Text style={styles.label}>Е-пошта</Text>
               <TextInput
-                accessibilityLabel="Email"
+                accessibilityLabel="Е-пошта"
                 autoCapitalize="none"
                 autoComplete="email"
                 editable={!isBusy}
@@ -85,15 +85,15 @@ export default function AuthScreen() {
             </View>
 
             <View style={styles.field}>
-              <Text style={styles.label}>Password</Text>
+              <Text style={styles.label}>Лозинка</Text>
               <TextInput
-                accessibilityLabel="Password"
+                accessibilityLabel="Лозинка"
                 autoCapitalize="none"
                 autoComplete="password"
                 editable={!isBusy}
                 onChangeText={setPassword}
                 onSubmitEditing={() => void submit('sign-in')}
-                placeholder="Your password"
+                placeholder="Твојата лозинка"
                 returnKeyType="done"
                 secureTextEntry
                 style={styles.input}
@@ -116,7 +116,7 @@ export default function AuthScreen() {
               {pendingAction === 'sign-in' ? (
                 <ActivityIndicator color="#FFFFFF" />
               ) : (
-                <Text style={styles.primaryButtonLabel}>Sign In</Text>
+                <Text style={styles.primaryButtonLabel}>Најави се</Text>
               )}
             </Pressable>
 
@@ -134,7 +134,7 @@ export default function AuthScreen() {
               {pendingAction === 'sign-up' ? (
                 <ActivityIndicator color="#2E6B4F" />
               ) : (
-                <Text style={styles.secondaryButtonLabel}>Create Account</Text>
+                <Text style={styles.secondaryButtonLabel}>Креирај профил</Text>
               )}
             </Pressable>
           </View>

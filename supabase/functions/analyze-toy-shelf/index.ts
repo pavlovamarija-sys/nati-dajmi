@@ -6,6 +6,10 @@ import { isValidCropRegistrationPath, TOY_IMAGE_BUCKET, type CropRegistrationInp
 import type { ToyLocalization, ToyLocalizationQuery } from './localization.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import { ReplicateGroundingDinoProvider } from './replicate-grounding-dino.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { OpenAIMacedonianLocalizationProvider, MacedonianLocalizationProviderError } from './openai-macedonian-localization.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import type { MacedonianLocalizedCandidate as LocalizedCandidateText } from './macedonian-localization.ts';
 
 type SupportedMimeType = 'image/jpeg' | 'image/png' | 'image/webp';
 type Recommendation = 'KEEP' | 'ROTATE' | 'PASS_ON';
@@ -76,7 +80,7 @@ type DenoRuntime = {
 declare const Deno: DenoRuntime;
 
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
-const OPENAI_MODEL = 'gpt-4o-mini';
+const OPENAI_MODEL = 'gpt-5.6-sol';
 const MAX_TOY_ITEMS = 20;
 const supportedMimeTypes = new Set<SupportedMimeType>([
   'image/jpeg',
@@ -160,8 +164,8 @@ Inspect only toys visibly present in the supplied image. Do not invent toys that
 cannot reasonably be seen. Missing a toy is preferable to confidently inventing one.
 
 When an object is visibly a toy but its exact identity is uncertain, prefer a cautious
-generic description such as "small toy vehicle", "wooden animal figure", "stacking
-toy", or "soft toy". Do not infer a brand name or specific product identity unless it
+generic Macedonian description such as "мало возило играчка", "дрвена животинска
+фигура", "играчка за редење", or "мека играчка". Do not infer a brand name or specific product identity unless it
 is clearly visible in the image. A lower confidence score is appropriate for an
 uncertain-but-visible toy; omit an object if it cannot reasonably be identified as a
 toy.
@@ -506,7 +510,7 @@ async function analyzeDetectedCandidates(
       {
         type: 'input_image',
         image_url: `data:image/jpeg;base64,${candidate.imageBase64}`,
-        detail: 'low',
+        detail: 'high',
       },
     );
   }
@@ -612,27 +616,76 @@ async function analyzeDetectedCandidates(
     usage,
   });
 
+  const acceptedCandidates = semantic.candidates.filter((candidate): candidate is CandidateModelResult & {
+    isToy: true;
+    name: string;
+    recommendation: Recommendation;
+    reason: string;
+  } => candidate.isToy);
+
+  let localizedCandidates: Map<string, LocalizedCandidateText>;
+  if (acceptedCandidates.length === 0) {
+    localizedCandidates = new Map();
+  } else {
+    const localizationProvider = new OpenAIMacedonianLocalizationProvider(apiKey);
+    try {
+      const localizationResult = await localizationProvider.localize({
+        candidates: acceptedCandidates.map((candidate) => ({
+          candidateId: candidate.candidateId,
+          name: candidate.name,
+          category: candidate.category,
+          recommendation: candidate.recommendation,
+          reason: candidate.reason,
+          playIdeas: candidate.playIdeas,
+        })),
+      });
+      localizedCandidates = new Map(
+        localizationResult.candidates.map((candidate) => [candidate.candidateId, candidate]),
+      );
+    } catch (error) {
+      const providerError = error instanceof MacedonianLocalizationProviderError
+        ? {
+            code: error.code,
+            status: error.status,
+            requestId: error.requestId,
+            message: error.message,
+          }
+        : safeError(error);
+      console.error('[toy-analysis] macedonian_localization_failed', providerError);
+      return jsonResponse({ error: 'Analysis presentation is unavailable.' }, 502);
+    }
+  }
+
+  if (
+    localizedCandidates.size !== acceptedCandidates.length ||
+    acceptedCandidates.some((candidate) => !localizedCandidates.has(candidate.candidateId))
+  ) {
+    console.error('[toy-analysis] macedonian_localization_failed', {
+      code: 'candidate_set_mismatch',
+    });
+    return jsonResponse({ error: 'Analysis presentation is unavailable.' }, 502);
+  }
+
   const result: ToyAnalysisResult = {
     analysisId: '',
     childAgeMonths: input.childAgeMonths,
-    toys: semantic.candidates
-      .filter((candidate): candidate is CandidateModelResult & {
-        isToy: true;
-        name: string;
-        recommendation: Recommendation;
-        reason: string;
-      } => candidate.isToy)
-      .map((candidate) => ({
+    toys: acceptedCandidates.map((candidate) => {
+      const localized = localizedCandidates.get(candidate.candidateId)!;
+      return {
         id: crypto.randomUUID(),
         candidateId: candidate.candidateId,
-        name: candidate.name,
-        category: candidate.category,
+        name: localized.name,
+        category: localized.category,
         recommendation: candidate.recommendation,
-        reason: candidate.reason,
+        reason: localized.reason,
         confidence: candidate.confidence,
-        playIdeas: candidate.playIdeas,
+        playIdeas: localized.playIdeas.map((playIdea) => ({
+          title: playIdea.title,
+          description: playIdea.description,
+        })),
         boundingBox: null,
-      })),
+      };
+    }),
   };
   const persistence = await persistAnalysis(result, userId);
   if (!persistence.ok) {
@@ -647,6 +700,11 @@ You analyze only the supplied candidate crop images. They have already been sele
 by a toy-focused object detector. The detector has defined the complete candidate
 inventory; do not search for additional objects or infer objects outside these crops.
 
+Write all source fields in clear, concise, literal English: name, category, reason,
+and playIdeas titles and descriptions. Preserve recognized proper names, brands, and
+characters such as Paw Patrol Marshall. A separate localization step handles
+Macedonian presentation; do not generate Macedonian-language text here.
+
 Treat a candidate as a toy when it reasonably appears to contain a toy, toy figure,
 animal figure, plush or stuffed toy, doll, toy vehicle, block or construction toy,
 puzzle piece or toy, interactive toy, or a recognizable part of a toy. A candidate
@@ -655,9 +713,9 @@ cropped legs, ears, or wheels, occlusion, an unusual viewing angle, or uncertain
 about the exact product identity are not sufficient reasons to set isToy to false.
 
 If a candidate clearly appears toy-like but its exact identity is uncertain, set
-isToy to true, use a cautious generic name such as "plastic animal figure", "soft
-toy dog", "small toy vehicle", or "toy figure", and lower semantic confidence when
-appropriate. Use isToy false only when the visible candidate clearly appears to be a
+isToy to true, use a cautious generic English name such as "plastic animal figure",
+"soft toy dog", "small toy vehicle", or "toy figure", and lower semantic confidence
+when appropriate. Use isToy false only when the visible candidate clearly appears to be a
 non-toy object such as furniture, wall or background, a container or basket with no
 toy as the actual candidate, a household object, clothing, or another unrelated
 object. When uncertain between a partially visible toy and a non-toy, prefer the toy
@@ -667,14 +725,106 @@ hallucinate a specific brand or character merely to avoid rejection.
 For every supplied candidateId, decide whether the crop represents a toy. If isToy
 is false, return null for name, category, recommendation, reason, and confidence,
 and return an empty playIdeas array. If isToy is true, return a cautious useful
-name, category or null, exactly one KEEP/ROTATE/PASS_ON recommendation, a concise
-parent-friendly reason, and confidence from 0 to 1 or null. Use a brand or licensed
+name, category or null, exactly one KEEP/ROTATE/PASS_ON recommendation, one short
+concrete parent-friendly reason, and confidence from 0 to 1 or null. Use a brand or licensed
 character only when clearly recognizable; otherwise use a generic visual name.
 
+Use the most specific identity clearly supported by the crop. Apply this naming
+hierarchy in order: (1) a clearly recognizable brand, character, or product identity;
+(2) a specific toy or object identity; (3) a specific animal or object type; and
+(4) a generic toy category only when necessary. For example, use "plastic horse
+figure" rather than "plastic animal figure" when the animal is clearly a horse. If a
+licensed character such as Paw Patrol Marshall is clearly recognizable, use that
+identity rather than reducing it to a generic "soft toy dog". Never invent a brand,
+character, or product identity that the crop does not support. When identity is
+genuinely uncertain, use a generic visual name and lower confidence. Do not become
+more generic than the visible evidence requires. Keep names concise and useful,
+preferably "[recognized identity or product] + [toy type]", such as "Marshall Paw
+Patrol plush toy", "VTech interactive dog", or "plastic horse figure". Do not write
+long product descriptions. Use a simple category such as "plush toy", "interactive
+toy", "animal figure", "building toy", or "toy vehicle", never a marketing phrase.
+
+Choose recommendations using this stable rubric:
+
+KEEP: The toy is clearly age-appropriate and has meaningful continued play value,
+such as open-ended use, developmental value, strong imaginative or play potential,
+repeated useful engagement, or a distinctive role that is not obviously duplicated.
+
+ROTATE: The toy is still age-appropriate and potentially useful, but there is a
+reasonable reason not to keep it continuously available, such as narrow or repetitive
+play, likely duplication with similar toys, lower novelty, usefulness mainly when
+periodically reintroduced, or temporarily reducing clutter or overstimulation.
+
+PASS_ON: Use only when there is reasonably strong evidence that the toy is clearly
+outgrown, poorly suited to the supplied child age, substantially redundant or
+duplicated, or unlikely to provide meaningful continued play value. Do not use
+PASS_ON merely because a toy is simple.
+
+When evidence is ambiguous between KEEP and ROTATE, compare the candidate against
+these criteria consistently and choose the best-supported recommendation rather than
+arbitrarily varying the decision.
+
 For KEEP, return exactly 2 or 3 short practical play ideas appropriate for the
-supplied child age that use that toy and require no purchase. For ROTATE and
-PASS_ON, return an empty playIdeas array. Never recommend disposal based on an
-unsupported assumption.
+supplied child age that use that toy and require no purchase. Each idea must be
+concrete, practical, understandable without interpretation, directly related to the
+specific toy, and meaningfully different from the other ideas. The title and
+description must describe the same activity. Avoid vague titles such as "mini game",
+"fun activity", or "play together" unless the description defines a specific action.
+Use a short title and one short instruction, preferably one sentence, that tells the
+parent exactly what to do. The activity itself is enough: do not append developmental,
+educational, social, creativity, engagement, exploration, or movement commentary.
+Do not add generic developmental filler. Base ideas only on capabilities visibly
+supported by the crop, capabilities explicitly supported by a clearly identified toy,
+or basic play uses naturally inherent to that toy type.
+
+Visible feature does not mean known functionality. Seeing buttons does not establish
+what pressing them does; printed numbers do not establish speech or number-teaching;
+musical-looking symbols do not establish songs; a speaker-like area does not
+establish sound; printed icons do not establish functionality; and controls do not
+establish lights, speech, music, movement, or electronic behavior. Mention a
+capability only when the crop genuinely supports it
+or it is safely known from a clearly identified toy or product. Do not claim or
+invent sounds, songs or music, lights, speech, movement, dancing, electronic
+interaction, educational content, transformation, or accessories otherwise.
+
+When functionality is uncertain, use only visibly safe actions. Visible numbers may
+support pointing to, finding, or naming numbers, but not pressing a button to hear
+numbers, listening to songs, or activating sounds. Visible buttons may support
+pressing the visible buttons, but no claim about the result. A simple horse figure
+supports imaginative role-play; a plush character supports hugging and pretend play.
+For ROTATE and PASS_ON, return an empty playIdeas array. Never recommend disposal
+based on an unsupported assumption.
+
+Every reason must explain why the selected recommendation fits this specific toy.
+Normally use one short sentence of about 8 to 20 words; use at most two short
+sentences only when genuinely necessary. Prefer concrete play characteristics and
+practical value. Do not write a mini developmental assessment, and do not justify a
+recommendation merely by saying the toy matches the child's age. Avoid abstract,
+marketing-like phrases such as "promotes engagement", "supports development",
+"developmental stage", "valuable addition", "provides opportunities", "encourages
+participation", "suitable for continued engagement", "educational benefits",
+"enhances creativity", or "fosters social skills".
+
+Use only the crop, toy identity/category, child age, and genuinely visible
+relationships among the supplied candidates. Do not imply knowledge of usage
+frequency, boredom, favorites, ownership or purchase history, invisible condition,
+or household behavior. Do not compare which candidate receives more play, infer that
+a toy has been unused recently, or infer that the child prefers another candidate.
+Several candidates appearing in one photo provide no usage-history evidence. For
+KEEP, state the actual continued play value. For ROTATE,
+use a concrete reason such as narrow or repetitive play, visible overlap with another
+similar candidate, or the toy-specific value of periodically varying the available
+play opportunities. ROTATE does not require evidence that the child stopped using the
+toy, and do not mechanically say to bring it back later in every ROTATE reason. Do not
+claim that it offers fewer experiences, receives less engagement, is more boring, or
+is used less than other toys. Do not claim the toy is used less often, and do not use circular
+reasoning such as "rotate because it need not be available all the time." For
+PASS_ON, state the evidence for being outgrown, poorly suited, substantially
+redundant, or unlikely to provide continued value. Use cross-candidate duplication
+only when it is genuinely visible, such as clearly duplicate cars or nearly identical
+figures. Describe the visible overlap rather than inventing child behavior. Do not use
+vague comparisons such as "the other toys are more engaging" or "offers fewer
+experiences than the other toys".
 `.trim();
 
 function candidateSemanticSchema(candidateIds: string[]): Record<string, unknown> {

@@ -46,24 +46,24 @@ export function getParentFriendlyAuthError(error: unknown): string {
   const message = authError?.message?.toLowerCase() ?? '';
 
   if (message.includes('invalid login credentials')) {
-    return 'The email or password is incorrect.';
+    return 'Е-поштата или лозинката не е точна.';
   }
 
   if (message.includes('email not confirmed')) {
-    return 'Please confirm your email before signing in.';
+    return 'Потврди ја е-поштата пред да се најавиш.';
   }
 
   if (message.includes('already registered') || message.includes('already been registered')) {
-    return 'An account with this email already exists.';
+    return 'Веќе постои профил со оваа е-пошта.';
   }
 
   if (message.includes('password')) {
-    return 'Please choose a password that meets the requirements.';
+    return 'Избери лозинка што ги исполнува барањата.';
   }
 
   if (message.includes('email')) {
-    return 'Please enter a valid email address.';
+    return 'Внеси важечка адреса за е-пошта.';
   }
 
-  return "We couldn't complete that request. Please try again.";
+  return 'Не можевме да го завршиме барањето. Обиди се повторно.';
 }

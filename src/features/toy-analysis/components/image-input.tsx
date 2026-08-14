@@ -17,34 +17,34 @@ export function ImageInput({
 }: ImageInputProps) {
   return (
     <View>
-      <Text style={styles.label}>Toy shelf photo</Text>
+      <Text style={styles.label}>Фотографија од играчките</Text>
       <Text style={styles.helper}>
-        Take a clear photo showing as many toys as possible.
+        Сликај јасна фотографија на која се гледаат што е можно повеќе играчки.
       </Text>
 
       {image ? (
         <Image
-          accessibilityLabel="Selected toy shelf"
+          accessibilityLabel="Избрана фотографија од играчките"
           resizeMode="cover"
           source={{ uri: image.uri }}
           style={styles.preview}
         />
       ) : (
         <View style={styles.placeholder}>
-          <Text style={styles.placeholderTitle}>Add a shelf photo</Text>
-          <Text style={styles.placeholderText}>Camera or photo library</Text>
+          <Text style={styles.placeholderTitle}>Додај фотографија од играчките</Text>
+          <Text style={styles.placeholderText}>Камера или галерија</Text>
         </View>
       )}
 
       <View style={styles.actions}>
         <ActionButton
           disabled={busy}
-          label={image ? 'Take new photo' : 'Take photo'}
+          label={image ? 'Сликај повторно' : 'Сликај'}
           onPress={onTakePhoto}
         />
         <ActionButton
           disabled={busy}
-          label={image ? 'Choose another' : 'Choose photo'}
+          label={image ? 'Избери друга' : 'Избери фотографија'}
           onPress={onChoosePhoto}
         />
       </View>

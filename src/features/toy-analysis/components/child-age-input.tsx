@@ -10,8 +10,8 @@ type ChildAgeInputProps = {
 };
 
 const units: { label: string; value: AgeUnit }[] = [
-  { label: 'Months', value: 'months' },
-  { label: 'Years', value: 'years' },
+  { label: 'месеци', value: 'months' },
+  { label: 'години', value: 'years' },
 ];
 
 export function ChildAgeInput({
@@ -27,10 +27,10 @@ export function ChildAgeInput({
 
   return (
     <View>
-      <Text style={styles.label}>Child&apos;s age</Text>
+      <Text style={styles.label}>Возраст на детето</Text>
       <View style={styles.row}>
         <TextInput
-          accessibilityLabel="Child's age"
+          accessibilityLabel="Возраст на детето"
           inputMode="numeric"
           keyboardType="number-pad"
           maxLength={3}
