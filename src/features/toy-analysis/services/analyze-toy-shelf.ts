@@ -81,7 +81,7 @@ export async function analyzeToyShelf(
     });
 
     if (isLocalDetectorConfigured()) {
-      return await analyzeWithLocalDetector(canonicalImage.image, childAgeMonths);
+      return await analyzeWithLocalDetector(canonicalImage.image, childAgeMonths, canonicalImage.base64);
     }
 
     stage = 'function_invoke_started';
@@ -129,6 +129,7 @@ export async function analyzeToyShelf(
 async function analyzeWithLocalDetector(
   canonicalImage: ToyShelfImage,
   childAgeMonths: number,
+  sourceImageBase64: string,
 ): Promise<ToyAnalysisResult> {
   const detectorStartedAt = Date.now();
   logDevelopmentEvent('local_detector_started', {
@@ -160,10 +161,13 @@ async function analyzeWithLocalDetector(
     body: {
       mode: 'detected-candidates',
       childAgeMonths,
+      sourceImageBase64,
+      includeDebug: __DEV__,
       candidateImages: candidateImages.map((candidate) => ({
         candidateId: candidate.candidateId,
         imageBase64: candidate.semanticImageBase64,
         mimeType: 'image/jpeg',
+        boundingBox: candidate.boundingBox,
       })),
     },
   });
@@ -175,6 +179,7 @@ async function analyzeWithLocalDetector(
     usage: readSafeUsage(data),
     error: error ? getSafeErrorMetadata(error) : undefined,
   });
+  logCropRefinementDebug(data);
   if (error) {
     throw new ToyAnalysisServiceError('function-failed', { cause: error });
   }
@@ -184,8 +189,9 @@ async function analyzeWithLocalDetector(
     throw new ToyAnalysisServiceError('invalid-response');
   }
 
-  await persistAcceptedToyCrops(result);
-  return result;
+  const resultWithCrops = await addLocalToyCrops(result, canonicalImage);
+  await persistAcceptedToyCrops(resultWithCrops);
+  return resultWithCrops;
 }
 
 async function persistAcceptedToyCrops(result: ToyAnalysisResult): Promise<void> {
@@ -251,7 +257,7 @@ function parseLocalSemanticResult(
     }
     seenCandidateIds.add(candidateId);
     candidateIdByToyId.set(toyId, candidateId);
-    return { ...rawToy, boundingBox: candidate.boundingBox };
+    return { ...rawToy, boundingBox: rawToy.boundingBox ?? candidate.boundingBox };
   });
 
   const parsed = parseToyAnalysisResult({ ...value, toys });
@@ -278,6 +284,37 @@ function readSafeUsage(value: unknown): Record<string, number | null> | undefine
     outputTokens: typeof value.usage.outputTokens === 'number' ? value.usage.outputTokens : null,
     totalTokens: typeof value.usage.totalTokens === 'number' ? value.usage.totalTokens : null,
   };
+}
+
+function logCropRefinementDebug(value: unknown): void {
+  if (!__DEV__ || !isRecord(value) || !Array.isArray(value.cropRefinementDebug)) {
+    return;
+  }
+
+  for (const item of value.cropRefinementDebug) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    console.info('[toy-analysis] crop_refinement_debug', {
+      candidateId: typeof item.candidateId === 'string' ? item.candidateId : null,
+      cropCompleteness: item.cropCompleteness,
+      primaryModel: item.primaryModel,
+      primaryAttempted: item.primaryAttempted === true,
+      primarySucceeded: item.primarySucceeded === true,
+      primaryRefinedBoundingBox: item.primaryRefinedBoundingBox ?? null,
+      primarySourceBoundaryEdges: Array.isArray(item.primarySourceBoundaryEdges) ? item.primarySourceBoundaryEdges : [],
+      primarySourceBoundarySuspicious: item.primarySourceBoundarySuspicious === true,
+      terraEscalated: item.terraEscalated === true,
+      terraEscalationReason: item.terraEscalationReason ?? null,
+      fallbackModel: item.fallbackModel,
+      fallbackAttempted: item.fallbackAttempted === true,
+      fallbackSucceeded: item.fallbackSucceeded === true,
+      fallbackRefinedBoundingBox: item.fallbackRefinedBoundingBox ?? null,
+      fallbackSourceBoundaryEdges: Array.isArray(item.fallbackSourceBoundaryEdges) ? item.fallbackSourceBoundaryEdges : [],
+      originalCombinedBoundingBox: item.originalCombinedBoundingBox,
+      finalBoundingBox: item.finalBoundingBox,
+    });
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -10,6 +10,14 @@ import { ReplicateGroundingDinoProvider } from './replicate-grounding-dino.ts';
 import { OpenAIMacedonianLocalizationProvider, MacedonianLocalizationProviderError } from './openai-macedonian-localization.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import type { MacedonianLocalizedCandidate as LocalizedCandidateText } from './macedonian-localization.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { PHYSICAL_TOY_RECONCILIATION_INSTRUCTIONS } from './physical-toy-instructions.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { unionCandidateRegions, type NormalizedCandidateRegion } from './candidate-region.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { areCandidateAssociationsValid } from './candidate-associations.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { buildCropRefinementRequestCandidates, CROP_REFINEMENT_INSTRUCTIONS, cropRefinementSchema, finalizeCropRefinementRegion, isCropCompleteness, selectCropRefinementCandidateIds, shouldEscalateCropRefinement, trustedPrimarySourceBoundaryEdges, validateCropRefinementOutput, type CropCompleteness, type CropRefinementEscalationReason, type SourceBoundaryEdge } from './crop-refinement.ts';
 
 type SupportedMimeType = 'image/jpeg' | 'image/png' | 'image/webp';
 type Recommendation = 'KEEP' | 'ROTATE' | 'PASS_ON';
@@ -27,11 +35,14 @@ type CandidateSemanticImage = {
   candidateId: string;
   imageBase64: string;
   mimeType: 'image/jpeg';
+  boundingBox: BoundingBox;
 };
 
 type AnalyzeDetectedCandidatesRequest = {
   mode: 'detected-candidates';
   childAgeMonths: number;
+  sourceImageBase64: string;
+  includeDebug?: boolean;
   candidateImages: CandidateSemanticImage[];
 };
 
@@ -72,6 +83,26 @@ type ToyAnalysisResult = {
   toys: ToyAnalysisItem[];
 };
 
+type CropRefinementDebug = {
+  candidateId: string;
+  cropCompleteness: CropCompleteness;
+  primaryModel: string;
+  primaryAttempted: boolean;
+  primarySucceeded: boolean;
+  primaryRefinedBoundingBox: BoundingBox | null;
+  primarySourceBoundaryEdges: SourceBoundaryEdge[];
+  primarySourceBoundarySuspicious: boolean;
+  terraEscalated: boolean;
+  terraEscalationReason: CropRefinementEscalationReason | null;
+  fallbackModel: string;
+  fallbackAttempted: boolean;
+  fallbackSucceeded: boolean;
+  fallbackRefinedBoundingBox: BoundingBox | null;
+  fallbackSourceBoundaryEdges: SourceBoundaryEdge[];
+  originalCombinedBoundingBox: BoundingBox;
+  finalBoundingBox: BoundingBox;
+};
+
 type DenoRuntime = {
   env: { get(name: string): string | undefined };
   serve(handler: (request: Request) => Response | Promise<Response>): void;
@@ -81,6 +112,8 @@ declare const Deno: DenoRuntime;
 
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_MODEL = 'gpt-5.6-sol';
+const CROP_REFINEMENT_PRIMARY_MODEL = 'gpt-4o-mini';
+const CROP_REFINEMENT_FALLBACK_MODEL = 'gpt-5.6-terra';
 const MAX_TOY_ITEMS = 20;
 const supportedMimeTypes = new Set<SupportedMimeType>([
   'image/jpeg',
@@ -156,9 +189,12 @@ Look carefully for small toys as well as large, obvious toys. Consider toys that
 partially occluded, inside baskets, stacked, or next to other toys. Make a careful
 effort to inspect small visible objects before deciding they cannot be identified.
 
-Identify visually distinct toys separately when reasonably possible. Group objects
-only when they are genuinely the same toy type or are too visually overlapping to
-distinguish reliably.
+Identify visually distinct physical toys separately when reasonably possible. Do not
+group separate objects merely because they are the same toy type. Group only when
+objects are too visually overlapping to distinguish reliably as separate toys or
+form a genuine inseparable toy group in the image.
+
+${PHYSICAL_TOY_RECONCILIATION_INSTRUCTIONS}
 
 Inspect only toys visibly present in the supplied image. Do not invent toys that
 cannot reasonably be seen. Missing a toy is preferable to confidently inventing one.
@@ -484,6 +520,8 @@ function createLocalizationQuery(toy: ModelToy): string {
 type CandidateModelResult = {
   candidateId: string;
   isToy: boolean;
+  belongsToCandidateId: string | null;
+  cropCompleteness: CropCompleteness | null;
   name: string | null;
   category: string | null;
   recommendation: Recommendation | null;
@@ -623,6 +661,65 @@ async function analyzeDetectedCandidates(
     reason: string;
   } => candidate.isToy);
 
+  const candidateRegions = new Map(
+    input.candidateImages.map((candidate) => [candidate.candidateId, candidate.boundingBox]),
+  );
+  const originalRegions = new Map(
+    acceptedCandidates.map((candidate) => [
+      candidate.candidateId,
+      getCombinedCandidateRegion(candidate.candidateId, semantic.candidates, candidateRegions),
+    ]),
+  );
+  const primaryRefinement = await refineAcceptedCandidates(
+    input,
+    acceptedCandidates,
+    originalRegions,
+    apiKey,
+    CROP_REFINEMENT_PRIMARY_MODEL,
+  );
+  const escalation = acceptedCandidates.map((candidate) => {
+    const primary = primaryRefinement.diagnostics.get(candidate.candidateId)!;
+    const decision = shouldEscalateCropRefinement({
+      cropCompleteness: candidate.cropCompleteness!,
+      originalRegion: originalRegions.get(candidate.candidateId)!,
+      primaryRefinedRegion: primary.refined,
+      primarySourceBoundaryEdges: primary.sourceBoundaryEdges,
+      primarySucceeded: primary.succeeded,
+    });
+    const trustedPrimaryEdges = trustedPrimarySourceBoundaryEdges(
+      originalRegions.get(candidate.candidateId)!,
+      primary.refined,
+      primary.sourceBoundaryEdges,
+    );
+    return {
+      candidate,
+      ...decision,
+      primarySourceBoundarySuspicious:
+        decision.reason === 'SUSPICIOUS_PRIMARY_SOURCE_BOUNDARY',
+      trustedPrimaryEdges,
+    };
+  });
+  const escalatedCandidates = escalation
+    .filter((item) => item.shouldEscalate)
+    .map((item) => item.candidate);
+  const fallbackInputRegions = new Map<string, BoundingBox>();
+  for (const candidate of escalatedCandidates) {
+    const primary = primaryRefinement.diagnostics.get(candidate.candidateId)!;
+    const decision = escalation.find((item) =>
+      item.candidate.candidateId === candidate.candidateId
+    )!;
+    fallbackInputRegions.set(candidate.candidateId, getFinalCandidateRegion(
+      originalRegions.get(candidate.candidateId)!,
+      primary.refined,
+      decision.trustedPrimaryEdges,
+      undefined,
+      [],
+    ));
+  }
+  const fallbackRefinement = escalatedCandidates.length > 0
+    ? await refineAcceptedCandidates(input, escalatedCandidates, fallbackInputRegions, apiKey, CROP_REFINEMENT_FALLBACK_MODEL)
+    : emptyRefinementRun(acceptedCandidates);
+
   let localizedCandidates: Map<string, LocalizedCandidateText>;
   if (acceptedCandidates.length === 0) {
     localizedCandidates = new Map();
@@ -683,7 +780,13 @@ async function analyzeDetectedCandidates(
           title: playIdea.title,
           description: playIdea.description,
         })),
-        boundingBox: null,
+        boundingBox: getFinalCandidateRegion(
+          originalRegions.get(candidate.candidateId)!,
+          primaryRefinement.regions.get(candidate.candidateId),
+          escalation.find((item) => item.candidate.candidateId === candidate.candidateId)!.trustedPrimaryEdges,
+          fallbackRefinement.regions.get(candidate.candidateId),
+          fallbackRefinement.sourceBoundaryEdges.get(candidate.candidateId),
+        ),
       };
     }),
   };
@@ -692,7 +795,17 @@ async function analyzeDetectedCandidates(
     return jsonResponse({ error: 'Analysis could not be saved.' }, 500);
   }
   result.analysisId = persistence.analysisId;
-  return jsonResponse({ ...result, usage }, 200);
+  return jsonResponse({
+    ...result,
+    usage,
+    ...(input.includeDebug ? { cropRefinementDebug: buildCropRefinementDebug(
+      acceptedCandidates,
+      originalRegions,
+      primaryRefinement,
+      fallbackRefinement,
+      escalation,
+    ) } : {}),
+  }, 200);
 }
 
 const candidateSemanticInstructions = `
@@ -707,10 +820,20 @@ Macedonian presentation; do not generate Macedonian-language text here.
 
 Treat a candidate as a toy when it reasonably appears to contain a toy, toy figure,
 animal figure, plush or stuffed toy, doll, toy vehicle, block or construction toy,
-puzzle piece or toy, interactive toy, or a recognizable part of a toy. A candidate
+puzzle piece or toy, interactive toy, or a recognizable visible portion of a toy
+that is itself the candidate's physical object. A candidate
 does not need to be perfectly framed or completely visible. Partial visibility,
 cropped legs, ears, or wheels, occlusion, an unusual viewing angle, or uncertainty
 about the exact product identity are not sufficient reasons to set isToy to false.
+
+${PHYSICAL_TOY_RECONCILIATION_INSTRUCTIONS}
+
+Because the response must contain one record for every supplied candidateId, use
+isToy false with the normal null fields and empty playIdeas for a candidate suppressed
+as an attached component, detachable member of one sellable set, duplicate view, or
+less-complete view when another candidate represents the complete toy or set. This
+suppression means the candidate is not an independent sellable item; it does not mean
+that partially visible separate toys should be rejected.
 
 If a candidate clearly appears toy-like but its exact identity is uncertain, set
 isToy to true, use a cautious generic English name such as "plastic animal figure",
@@ -724,10 +847,21 @@ hallucinate a specific brand or character merely to avoid rejection.
 
 For every supplied candidateId, decide whether the crop represents a toy. If isToy
 is false, return null for name, category, recommendation, reason, and confidence,
-and return an empty playIdeas array. If isToy is true, return a cautious useful
+return belongsToCandidateId as the accepted representative candidateId when this
+candidate is an attached component, detachable set piece, associated accessory,
+duplicate, or partial view of that same sellable toy or set; otherwise return null.
+If isToy is true, return
+belongsToCandidateId as null and return a cautious useful
 name, category or null, exactly one KEEP/ROTATE/PASS_ON recommendation, one short
 concrete parent-friendly reason, and confidence from 0 to 1 or null. Use a brand or licensed
 character only when clearly recognizable; otherwise use a generic visual name.
+
+For every accepted candidate, also return cropCompleteness. Use COMPLETE unless
+there is positive visual evidence that a meaningful part of the complete sellable
+toy continues beyond the crop boundary. Use LIKELY_CLIPPED when a ladder, boom,
+wing, rotor, tail, handle, vehicle body, or other structural part is visibly cut by
+an image edge. Do not mark a toy clipped merely because it is near an edge. If
+uncertain, use COMPLETE. Suppressed candidates must return cropCompleteness as null.
 
 Use the most specific identity clearly supported by the crop. Apply this naming
 hierarchy in order: (1) a clearly recognizable brand, character, or product identity;
@@ -795,6 +929,13 @@ supports imaginative role-play; a plush character supports hugging and pretend p
 For ROTATE and PASS_ON, return an empty playIdeas array. Never recommend disposal
 based on an unsupported assumption.
 
+For a detached accessory, associate it only when there is strong semantic evidence
+that it belongs to the accepted parent toy, such as a matching brand/design,
+obvious remote-control relationship, or recognizable accessory-to-product relation.
+Do not associate a nearby object merely because it is close, overlaps, or looks
+similar. A matching remote beside a HUINA fire truck belongs to the truck; two
+unrelated cars or a car beside an unrelated remote remain independent toys.
+
 Every reason must explain why the selected recommendation fits this specific toy.
 Normally use one short sentence of about 8 to 20 words; use at most two short
 sentences only when genuinely necessary. Prefer concrete play characteristics and
@@ -842,6 +983,8 @@ function candidateSemanticSchema(candidateIds: string[]): Record<string, unknown
           properties: {
             candidateId: { type: 'string', enum: candidateIds },
             isToy: { type: 'boolean' },
+            belongsToCandidateId: { type: ['string', 'null'], enum: [...candidateIds, null] },
+            cropCompleteness: { type: ['string', 'null'], enum: ['COMPLETE', 'LIKELY_CLIPPED', null] },
             name: { type: ['string', 'null'] },
             category: { type: ['string', 'null'] },
             recommendation: {
@@ -865,7 +1008,7 @@ function candidateSemanticSchema(candidateIds: string[]): Record<string, unknown
             },
           },
           required: [
-            'candidateId', 'isToy', 'name', 'category', 'recommendation',
+            'candidateId', 'isToy', 'belongsToCandidateId', 'cropCompleteness', 'name', 'category', 'recommendation',
             'reason', 'confidence', 'playIdeas',
           ],
         },
@@ -894,6 +1037,9 @@ function validateCandidateSemanticOutput(
   if (byId.size !== expected.size) {
     return { ok: false };
   }
+  if (!areCandidateAssociationsValid([...byId.values()], expectedIds)) {
+    return { ok: false };
+  }
   return { ok: true, candidates: expectedIds.map((id) => byId.get(id)!) };
 }
 
@@ -905,23 +1051,264 @@ function validateCandidateSemanticItem(value: unknown): CandidateModelResult | n
   if (!candidateId) return null;
   if (!value.isToy) {
     if (
+      !(value.belongsToCandidateId === null || typeof value.belongsToCandidateId === 'string') ||
+      value.cropCompleteness !== null ||
       value.name !== null || value.category !== null || value.recommendation !== null ||
       value.reason !== null || value.confidence !== null ||
       !Array.isArray(value.playIdeas) || value.playIdeas.length !== 0
     ) return null;
-    return { candidateId, isToy: false, name: null, category: null, recommendation: null, reason: null, confidence: null, playIdeas: [] };
+    return { candidateId, isToy: false, belongsToCandidateId: value.belongsToCandidateId, cropCompleteness: null, name: null, category: null, recommendation: null, reason: null, confidence: null, playIdeas: [] };
   }
   const name = typeof value.name === 'string' ? value.name.trim() : '';
   const reason = typeof value.reason === 'string' ? value.reason.trim() : '';
   const category = value.category === null ? null : typeof value.category === 'string' && value.category.trim() ? value.category.trim() : undefined;
   const confidence = value.confidence;
   if (
+    value.belongsToCandidateId !== null ||
+    !isCropCompleteness(value.cropCompleteness) ||
     !name || !reason || category === undefined || !isRecommendation(value.recommendation) ||
     !(confidence === null || (typeof confidence === 'number' && Number.isFinite(confidence) && confidence >= 0 && confidence <= 1))
   ) return null;
   const playIdeas = validatePlayIdeas(value.playIdeas, value.recommendation);
   if (!playIdeas) return null;
-  return { candidateId, isToy: true, name, category, recommendation: value.recommendation, reason, confidence, playIdeas };
+  return { candidateId, isToy: true, belongsToCandidateId: null, cropCompleteness: value.cropCompleteness, name, category, recommendation: value.recommendation, reason, confidence, playIdeas };
+}
+
+function getCombinedCandidateRegion(
+  acceptedCandidateId: string,
+  candidates: readonly CandidateModelResult[],
+  regions: ReadonlyMap<string, BoundingBox>,
+): BoundingBox {
+  const associatedIds = candidates
+    .filter((candidate) => candidate.belongsToCandidateId === acceptedCandidateId)
+    .map((candidate) => candidate.candidateId);
+  const regionList: NormalizedCandidateRegion[] = [
+    acceptedCandidateId,
+    ...associatedIds,
+  ].map((candidateId) => {
+    const region = regions.get(candidateId);
+    if (!region) {
+      throw new Error('Candidate region is unavailable.');
+    }
+    return region;
+  });
+
+  return unionCandidateRegions(regionList);
+}
+
+function getFinalCandidateRegion(
+  originalRegion: BoundingBox,
+  primaryRefinedRegion: BoundingBox | null | undefined,
+  primarySourceBoundaryEdges: readonly SourceBoundaryEdge[] = [],
+  fallbackRefinedRegion: BoundingBox | null | undefined,
+  fallbackSourceBoundaryEdges: readonly SourceBoundaryEdge[] = [],
+): BoundingBox {
+  const primaryRegion = finalizeCropRefinementRegion(
+    originalRegion,
+    primaryRefinedRegion ?? undefined,
+    primarySourceBoundaryEdges,
+  );
+  return finalizeCropRefinementRegion(
+    primaryRegion,
+    fallbackRefinedRegion ?? undefined,
+    fallbackSourceBoundaryEdges,
+  );
+}
+
+type RefinementRunResult = {
+  regions: Map<string, BoundingBox>;
+  sourceBoundaryEdges: Map<string, SourceBoundaryEdge[]>;
+  diagnostics: Map<string, { attempted: boolean; succeeded: boolean; refined: BoundingBox | null; sourceBoundaryEdges: SourceBoundaryEdge[] }>;
+};
+
+async function refineAcceptedCandidates(
+  input: AnalyzeDetectedCandidatesRequest,
+  acceptedCandidates: readonly CandidateModelResult[],
+  originalRegions: ReadonlyMap<string, BoundingBox>,
+  apiKey: string,
+  model: string,
+): Promise<RefinementRunResult> {
+  const diagnostics = new Map<string, { attempted: boolean; succeeded: boolean; refined: BoundingBox | null; sourceBoundaryEdges: SourceBoundaryEdge[] }>(
+    acceptedCandidates.map((candidate) => [
+      candidate.candidateId,
+      { attempted: false, succeeded: false, refined: null, sourceBoundaryEdges: [] },
+    ]),
+  );
+  const candidateIds = selectCropRefinementCandidateIds(acceptedCandidates);
+  if (candidateIds.length === 0) {
+    return { regions: new Map(), sourceBoundaryEdges: new Map(), diagnostics };
+  }
+  const requestCandidates = buildCropRefinementRequestCandidates(
+    acceptedCandidates,
+    originalRegions,
+  );
+
+  const content: Array<Record<string, unknown>> = [
+    {
+      type: 'input_text',
+      text: [
+        CROP_REFINEMENT_INSTRUCTIONS,
+        JSON.stringify(requestCandidates),
+      ].join('\n'),
+    },
+    {
+      type: 'input_image',
+      image_url: `data:image/jpeg;base64,${input.sourceImageBase64}`,
+      detail: 'high',
+    },
+  ];
+
+  const startedAt = Date.now();
+  console.info('[toy-analysis] crop_refinement_started', {
+    candidateCount: acceptedCandidates.length,
+    candidateIds,
+    model,
+    detail: 'high',
+  });
+  for (const candidate of acceptedCandidates) {
+    diagnostics.set(candidate.candidateId, { attempted: true, succeeded: false, refined: null, sourceBoundaryEdges: [] });
+  }
+
+  try {
+    const response = await fetch(OPENAI_RESPONSES_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        store: false,
+        max_output_tokens: 1200,
+        input: [{
+          role: 'developer',
+          content: [{
+            type: 'input_text',
+            text: 'Return only strict JSON geometry. Positive visual evidence is required before expanding beyond the current region.',
+          }],
+        }, { role: 'user', content }],
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'toy_crop_refinement',
+            strict: true,
+            schema: cropRefinementSchema(candidateIds),
+          },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn('[toy-analysis] crop_refinement_completed', {
+        refinedCount: 0,
+        latencyMs: Date.now() - startedAt,
+        status: response.status,
+      });
+      return { regions: new Map(), sourceBoundaryEdges: new Map(), diagnostics };
+    }
+
+    const body: unknown = await response.json();
+    const outputText = extractOutputText(body);
+    const parsed = outputText ? JSON.parse(outputText) : null;
+    const validated = validateCropRefinementOutput(parsed, candidateIds);
+    if (!validated) {
+      console.warn('[toy-analysis] crop_refinement_completed', {
+        refinedCount: 0,
+        latencyMs: Date.now() - startedAt,
+        reason: 'invalid_geometry',
+      });
+      return { regions: new Map(), sourceBoundaryEdges: new Map(), diagnostics };
+    }
+
+    const result = new Map(validated.map((candidate) => [
+      candidate.candidateId,
+      candidate.refinedBoundingBox,
+    ]));
+    const sourceBoundaryEdges = new Map(validated.map((candidate) => [
+      candidate.candidateId,
+      candidate.sourceBoundaryEdges,
+    ]));
+    for (const candidate of validated) {
+      diagnostics.set(candidate.candidateId, {
+        attempted: true,
+        succeeded: true,
+        refined: candidate.refinedBoundingBox,
+        sourceBoundaryEdges: candidate.sourceBoundaryEdges,
+      });
+    }
+    console.info('[toy-analysis] crop_refinement_completed', {
+      refinedCount: result.size,
+      latencyMs: Date.now() - startedAt,
+      usage: extractUsage(body),
+    });
+    return { regions: result, sourceBoundaryEdges, diagnostics };
+  } catch (error) {
+    console.warn('[toy-analysis] crop_refinement_completed', {
+      refinedCount: 0,
+      latencyMs: Date.now() - startedAt,
+      error: safeError(error),
+    });
+    return { regions: new Map(), sourceBoundaryEdges: new Map(), diagnostics };
+  }
+}
+
+function emptyRefinementRun(
+  candidates: readonly CandidateModelResult[],
+): RefinementRunResult {
+  return {
+    regions: new Map(),
+    sourceBoundaryEdges: new Map(),
+    diagnostics: new Map(candidates.map((candidate) => [
+      candidate.candidateId,
+      { attempted: false, succeeded: false, refined: null, sourceBoundaryEdges: [] },
+    ])),
+  };
+}
+
+function buildCropRefinementDebug(
+  acceptedCandidates: readonly CandidateModelResult[],
+  originalRegions: ReadonlyMap<string, BoundingBox>,
+  primary: RefinementRunResult,
+  fallback: RefinementRunResult,
+  escalation: readonly {
+    candidate: CandidateModelResult;
+    shouldEscalate: boolean;
+    reason: CropRefinementEscalationReason | null;
+    primarySourceBoundarySuspicious: boolean;
+    trustedPrimaryEdges: SourceBoundaryEdge[];
+  }[],
+): CropRefinementDebug[] {
+  return acceptedCandidates.map((candidate) => {
+    const original = originalRegions.get(candidate.candidateId)!;
+    const primaryDiagnostic = primary.diagnostics.get(candidate.candidateId)!;
+    const fallbackDiagnostic = fallback.diagnostics.get(candidate.candidateId)!;
+    const escalationDecision = escalation.find((item) => item.candidate.candidateId === candidate.candidateId)!;
+    return {
+      candidateId: candidate.candidateId,
+      cropCompleteness: candidate.cropCompleteness!,
+      primaryModel: CROP_REFINEMENT_PRIMARY_MODEL,
+      primaryAttempted: primaryDiagnostic.attempted,
+      primarySucceeded: primaryDiagnostic.succeeded,
+      primaryRefinedBoundingBox: primaryDiagnostic.refined,
+      primarySourceBoundaryEdges: primaryDiagnostic.sourceBoundaryEdges,
+      primarySourceBoundarySuspicious: escalationDecision.primarySourceBoundarySuspicious,
+      terraEscalated: escalationDecision.shouldEscalate,
+      terraEscalationReason: escalationDecision.reason,
+      fallbackModel: CROP_REFINEMENT_FALLBACK_MODEL,
+      fallbackAttempted: fallbackDiagnostic.attempted,
+      fallbackSucceeded: fallbackDiagnostic.succeeded,
+      fallbackRefinedBoundingBox: fallbackDiagnostic.refined,
+      fallbackSourceBoundaryEdges: fallbackDiagnostic.sourceBoundaryEdges,
+      originalCombinedBoundingBox: original,
+      finalBoundingBox: getFinalCandidateRegion(
+        original,
+        primary.regions.get(candidate.candidateId),
+        escalationDecision.trustedPrimaryEdges,
+        fallback.regions.get(candidate.candidateId),
+        fallback.sourceBoundaryEdges.get(candidate.candidateId),
+      ),
+    };
+  });
 }
 
 function extractUsage(value: unknown): { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null } {
@@ -1266,6 +1653,13 @@ function validateDetectedCandidatesRequest(
     return { ok: false, error: 'childAgeMonths must be a positive integer.' };
   }
 
+  const sourceImageBase64 = typeof value.sourceImageBase64 === 'string'
+    ? value.sourceImageBase64.trim()
+    : '';
+  if (!sourceImageBase64) {
+    return { ok: false, error: 'sourceImageBase64 is required.' };
+  }
+
   if (
     !Array.isArray(value.candidateImages) ||
     value.candidateImages.length === 0 ||
@@ -1286,16 +1680,18 @@ function validateDetectedCandidatesRequest(
     const imageBase64 = typeof candidate.imageBase64 === 'string'
       ? candidate.imageBase64.trim()
       : '';
+    const boundingBox = parseNormalizedBoundingBox(candidate.boundingBox);
     if (
       !candidateId ||
       ids.has(candidateId) ||
       !imageBase64 ||
-      candidate.mimeType !== 'image/jpeg'
+      candidate.mimeType !== 'image/jpeg' ||
+      !boundingBox
     ) {
       return { ok: false, error: 'Candidate IDs and JPEG images must be valid and unique.' };
     }
     ids.add(candidateId);
-    candidateImages.push({ candidateId, imageBase64, mimeType: 'image/jpeg' });
+    candidateImages.push({ candidateId, imageBase64, mimeType: 'image/jpeg', boundingBox });
   }
 
   return {
@@ -1303,9 +1699,31 @@ function validateDetectedCandidatesRequest(
     value: {
       mode: 'detected-candidates',
       childAgeMonths: Number(value.childAgeMonths),
+      sourceImageBase64,
+      includeDebug: value.includeDebug === true,
       candidateImages,
     },
   };
+}
+
+function parseNormalizedBoundingBox(value: unknown): BoundingBox | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const { x, y, width, height } = value;
+  if (
+    typeof x !== 'number' || !Number.isFinite(x) ||
+    typeof y !== 'number' || !Number.isFinite(y) ||
+    typeof width !== 'number' || !Number.isFinite(width) ||
+    typeof height !== 'number' || !Number.isFinite(height) ||
+    x < 0 || y < 0 || width <= 0 || height <= 0 ||
+    x + width > 1 || y + height > 1
+  ) {
+    return null;
+  }
+
+  return { x, y, width, height };
 }
 
 function isSupportedMimeType(value: unknown): value is SupportedMimeType {

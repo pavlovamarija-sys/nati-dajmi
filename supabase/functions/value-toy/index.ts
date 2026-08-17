@@ -1,7 +1,13 @@
+// @ts-ignore Deno resolves npm: specifiers when the Edge Function is bundled.
+import { createClient } from 'npm:@supabase/supabase-js@2.112.2';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { isExpectedAuthoritativeToyImagePath, TOY_IMAGE_BUCKET, validateAuthoritativeToyImage, type AuthoritativeToyImageResult } from './authoritative-toy-image.ts';
+// @ts-ignore Deno requires explicit TypeScript extensions for local modules.
+import { parseAuthoritativeToy, type AuthoritativeToy } from './authoritative-toy.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import { validateValueToyRequest } from './validation.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
-import { buildOpenAIValuationRequest, extractStructuredOutputText, OPENAI_RESPONSES_URL, parseModelValuation, VALUATION_METHOD, VALUATION_VERSION } from './openai-valuation.ts';
+import { buildOpenAIValuationRequest, extractStructuredOutputText, finalizeToyValuation, OPENAI_RESPONSES_URL, parseModelValuation } from './openai-valuation.ts';
 
 type DenoRuntime = {
   env: { get(name: string): string | undefined };
@@ -41,6 +47,38 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: input.error }, 400);
   }
 
+  const authentication = await authenticateRequest(request);
+
+  if (!authentication.ok) {
+    return jsonResponse(
+      { error: authentication.status === 401 ? 'Authentication required.' : 'Valuation service is unavailable.' },
+      authentication.status,
+    );
+  }
+
+  const lookup = await loadAuthoritativeToy(
+    authentication.client,
+    input.value.toyAnalysisItemId,
+  );
+
+  if (!lookup.ok) {
+    return jsonResponse(
+      { error: lookup.status === 404 ? 'Toy is unavailable.' : 'Valuation service is unavailable.' },
+      lookup.status,
+    );
+  }
+
+  const imageResult = await loadAuthoritativeToyImage(
+    authentication.client,
+    authentication.userId,
+    lookup.toy,
+  );
+  if (!imageResult.available) {
+    console.warn('value-toy authoritative image is unavailable.', {
+      reason: imageResult.reason,
+    });
+  }
+
   const apiKey = Deno.env.get('OPENAI_API_KEY')?.trim();
 
   if (!apiKey) {
@@ -58,7 +96,11 @@ Deno.serve(async (request) => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(
-        buildOpenAIValuationRequest(input.value.name, input.value.category),
+        buildOpenAIValuationRequest(
+          lookup.toy.name,
+          lookup.toy.category,
+          imageResult.available ? imageResult.image : undefined,
+        ),
       ),
     });
   } catch (error) {
@@ -106,14 +148,139 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: 'Valuation provider returned malformed data.' }, 502);
   }
 
-  return jsonResponse({
-    ...valuation,
-    metadata: {
-      valuationMethod: VALUATION_METHOD,
-      valuationVersion: VALUATION_VERSION,
-    },
-  }, 200);
+  return jsonResponse(finalizeToyValuation(valuation, imageResult.available), 200);
 });
+
+type UserSupabaseClient = ReturnType<typeof createClient>;
+
+type AuthenticationResult =
+  | { ok: true; client: UserSupabaseClient; userId: string }
+  | { ok: false; status: 401 | 500 };
+
+async function authenticateRequest(request: Request): Promise<AuthenticationResult> {
+  const authorization = request.headers.get('Authorization')?.trim();
+
+  if (!authorization?.startsWith('Bearer ')) {
+    return { ok: false, status: 401 };
+  }
+
+  const accessToken = authorization.slice('Bearer '.length).trim();
+  if (!accessToken) {
+    return { ok: false, status: 401 };
+  }
+
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')?.trim();
+  const anonKey = Deno.env.get('SUPABASE_ANON_KEY')?.trim();
+  if (!supabaseUrl || !anonKey) {
+    console.error('value-toy authentication configuration is missing.', {
+      supabaseUrlConfigured: Boolean(supabaseUrl),
+      anonKeyConfigured: Boolean(anonKey),
+    });
+    return { ok: false, status: 500 };
+  }
+
+  const client = createClient(supabaseUrl, anonKey, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  const { data, error } = await client.auth.getUser(accessToken);
+
+  if (error || !data.user?.id) {
+    console.warn('value-toy request authentication failed.', {
+      errorCode: readErrorCode(error),
+    });
+    return { ok: false, status: 401 };
+  }
+
+  return { ok: true, client, userId: data.user.id };
+}
+
+type ToyLookupResult =
+  | { ok: true; toy: AuthoritativeToy }
+  | { ok: false; status: 404 | 500 };
+
+async function loadAuthoritativeToy(
+  client: UserSupabaseClient,
+  toyAnalysisItemId: string,
+): Promise<ToyLookupResult> {
+  const { data, error } = await client
+    .from('toy_analysis_items')
+    .select('id, analysis_id, name, category, image_path')
+    .eq('id', toyAnalysisItemId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('value-toy authoritative item lookup failed.', {
+      errorCode: readErrorCode(error),
+    });
+    return { ok: false, status: 500 };
+  }
+
+  if (data === null) {
+    return { ok: false, status: 404 };
+  }
+
+  const toy = parseAuthoritativeToy(data);
+  if (!toy) {
+    console.error('value-toy authoritative item row was malformed.');
+    return { ok: false, status: 500 };
+  }
+
+  return { ok: true, toy };
+}
+
+async function loadAuthoritativeToyImage(
+  client: UserSupabaseClient,
+  userId: string,
+  toy: AuthoritativeToy,
+): Promise<AuthoritativeToyImageResult> {
+  if (toy.imagePath === null) {
+    return { available: false, reason: 'missing-path' };
+  }
+
+  if (!isExpectedAuthoritativeToyImagePath(
+    toy.imagePath,
+    userId,
+    toy.analysisId,
+    toy.toyAnalysisItemId,
+  )) {
+    return { available: false, reason: 'invalid-payload' };
+  }
+
+  let downloaded: Blob;
+  try {
+    const { data, error } = await client.storage
+      .from(TOY_IMAGE_BUCKET)
+      .download(toy.imagePath);
+
+    if (error || !data) {
+      return { available: false, reason: 'download-failed' };
+    }
+    downloaded = data;
+  } catch {
+    return { available: false, reason: 'download-failed' };
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await downloaded.arrayBuffer());
+  } catch {
+    return { available: false, reason: 'invalid-payload' };
+  }
+
+  const image = validateAuthoritativeToyImage(downloaded.type, bytes);
+  return image
+    ? { available: true, image }
+    : { available: false, reason: 'invalid-payload' };
+}
+
+function readErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return undefined;
+  }
+
+  return typeof error.code === 'string' ? error.code : undefined;
+}
 
 function safeError(error: unknown): { name: string; message: string } {
   return error instanceof Error

@@ -1,4 +1,13 @@
-import type { ToyValuation } from '@/features/toy-analysis/types/toy-valuation';
+import {
+  isParentReportedToyIssue,
+  isToyConditionConfirmationType,
+  isToyValuationCondition,
+  type ImageAwareToyValuation,
+  type ParentReportedToyIssue,
+  type PersistedToyValuation,
+  type ToyCondition,
+  type ToyValuation,
+} from '@/features/toy-analysis/types/toy-valuation';
 import { supabase } from '@/lib/supabase/client';
 
 const VALUATION_SELECT = `
@@ -8,11 +17,29 @@ const VALUATION_SELECT = `
   confidence,
   valuation_method,
   valuation_version,
-  created_at
+  created_at,
+  base_second_hand_value_denars,
+  base_value_confidence,
+  ai_condition,
+  ai_condition_confidence,
+  ai_condition_notes,
+  confirmed_condition,
+  condition_confirmation_type,
+  condition_confirmed_at,
+  parent_reported_issues,
+  parent_condition_note,
+  condition_adjustment_basis_points,
+  updated_at
 `;
 
 export type UpsertToyValuationInput = {
   toyAnalysisItemId: string;
+  baseSecondHandValueDenars: number;
+  baseValueConfidence: number | null;
+  aiCondition: ToyCondition;
+  aiConditionConfidence: number | null;
+  aiConditionNotes: readonly string[];
+  conditionAdjustmentBasisPoints: number;
   estimatedValueDenars: number;
   confidence: number | null;
   valuationMethod: string;
@@ -21,13 +48,25 @@ export type UpsertToyValuationInput = {
 
 export async function upsertToyValuation(
   input: UpsertToyValuationInput,
-): Promise<ToyValuation> {
+): Promise<ImageAwareToyValuation> {
   const validated = validateUpsertInput(input);
   const { data, error } = await supabase
     .from('toy_analysis_item_valuations')
     .upsert(
       {
         toy_analysis_item_id: validated.toyAnalysisItemId,
+        base_second_hand_value_denars: validated.baseSecondHandValueDenars,
+        base_value_confidence: validated.baseValueConfidence,
+        ai_condition: validated.aiCondition,
+        ai_condition_confidence: validated.aiConditionConfidence,
+        ai_condition_notes: validated.aiConditionNotes,
+        confirmed_condition: null,
+        condition_confirmation_type: null,
+        condition_confirmed_at: null,
+        parent_reported_issues: [],
+        parent_condition_note: null,
+        condition_adjustment_basis_points:
+          validated.conditionAdjustmentBasisPoints,
         estimated_value_denars: validated.estimatedValueDenars,
         confidence: validated.confidence,
         valuation_method: validated.valuationMethod,
@@ -39,15 +78,21 @@ export async function upsertToyValuation(
     .single();
 
   if (error) {
-    throw new Error('Could not save the toy valuation.', { cause: error });
+    throw new Error('Could not save the toy valuation.');
   }
 
-  return parsePersistedToyValuation(data);
+  const persisted = parsePersistedToyValuation(data);
+
+  if (persisted.generation !== 'v2') {
+    throw new Error('Could not save the toy valuation.');
+  }
+
+  return persisted;
 }
 
 export async function getToyValuation(
   toyAnalysisItemId: string,
-): Promise<ToyValuation | null> {
+): Promise<PersistedToyValuation | null> {
   const normalizedItemId = readNonblankString(toyAnalysisItemId);
 
   if (!normalizedItemId) {
@@ -61,7 +106,7 @@ export async function getToyValuation(
     .maybeSingle();
 
   if (error) {
-    throw new Error('Could not load the toy valuation.', { cause: error });
+    throw new Error('Could not load the toy valuation.');
   }
 
   return data === null ? null : parsePersistedToyValuation(data);
@@ -74,6 +119,37 @@ function validateUpsertInput(input: UpsertToyValuationInput): UpsertToyValuation
 
   if (!toyAnalysisItemId) {
     throw new Error('A valid toy analysis item ID is required.');
+  }
+
+  if (
+    !Number.isInteger(input.baseSecondHandValueDenars) ||
+    input.baseSecondHandValueDenars < 0
+  ) {
+    throw new Error('Base second-hand value must be a nonnegative integer.');
+  }
+
+  if (!isValidConfidence(input.baseValueConfidence)) {
+    throw new Error('Base-value confidence must be null or between 0 and 1.');
+  }
+
+  if (!isToyValuationCondition(input.aiCondition)) {
+    throw new Error('AI-assessed condition is invalid.');
+  }
+
+  if (!isValidConfidence(input.aiConditionConfidence)) {
+    throw new Error('AI condition confidence must be null or between 0 and 1.');
+  }
+
+  if (!isNonblankStringArray(input.aiConditionNotes)) {
+    throw new Error('AI condition notes are invalid.');
+  }
+
+  if (
+    !Number.isInteger(input.conditionAdjustmentBasisPoints) ||
+    input.conditionAdjustmentBasisPoints < -10000 ||
+    input.conditionAdjustmentBasisPoints > 10000
+  ) {
+    throw new Error('Condition adjustment is invalid.');
   }
 
   if (!Number.isInteger(input.estimatedValueDenars) || input.estimatedValueDenars < 0) {
@@ -94,6 +170,12 @@ function validateUpsertInput(input: UpsertToyValuationInput): UpsertToyValuation
 
   return {
     toyAnalysisItemId,
+    baseSecondHandValueDenars: input.baseSecondHandValueDenars,
+    baseValueConfidence: input.baseValueConfidence,
+    aiCondition: input.aiCondition,
+    aiConditionConfidence: input.aiConditionConfidence,
+    aiConditionNotes: input.aiConditionNotes.map((note) => note.trim()),
+    conditionAdjustmentBasisPoints: input.conditionAdjustmentBasisPoints,
     estimatedValueDenars: input.estimatedValueDenars,
     confidence: input.confidence,
     valuationMethod,
@@ -101,7 +183,7 @@ function validateUpsertInput(input: UpsertToyValuationInput): UpsertToyValuation
   };
 }
 
-function parsePersistedToyValuation(value: unknown): ToyValuation {
+function parsePersistedToyValuation(value: unknown): PersistedToyValuation {
   if (!isRecord(value)) {
     throw new Error('The persisted toy valuation contains malformed data.');
   }
@@ -126,7 +208,7 @@ function parsePersistedToyValuation(value: unknown): ToyValuation {
     throw new Error('The persisted toy valuation contains malformed data.');
   }
 
-  return {
+  const base = {
     id,
     toyAnalysisItemId,
     estimatedValueDenars: Number(estimatedValueDenars),
@@ -135,6 +217,108 @@ function parsePersistedToyValuation(value: unknown): ToyValuation {
     valuationVersion,
     createdAt,
   };
+
+  if (hasOnlyNullV2Fields(value)) {
+    return {
+      ...base,
+      generation: 'v1',
+    };
+  }
+
+  return parseImageAwareToyValuation(value, base);
+}
+
+function parseImageAwareToyValuation(
+  value: Record<string, unknown>,
+  base: Omit<ToyValuation, 'generation'>,
+): ImageAwareToyValuation {
+  const baseSecondHandValueDenars = value.base_second_hand_value_denars;
+  const baseValueConfidence = value.base_value_confidence;
+  const aiCondition = value.ai_condition;
+  const aiConditionConfidence = value.ai_condition_confidence;
+  const aiConditionNotes = value.ai_condition_notes;
+  const confirmedCondition = value.confirmed_condition;
+  const conditionConfirmationType = value.condition_confirmation_type;
+  const conditionConfirmedAt = readNullableTimestamp(value.condition_confirmed_at);
+  const parentReportedIssues = value.parent_reported_issues;
+  const parentConditionNote = readNullableNonblankString(value.parent_condition_note);
+  const conditionAdjustmentBasisPoints = value.condition_adjustment_basis_points;
+  const updatedAt = readTimestamp(value.updated_at);
+
+  const confirmationIsEmpty = confirmedCondition === null &&
+    conditionConfirmationType === null &&
+    conditionConfirmedAt === null;
+  const confirmationIsComplete = isToyValuationCondition(confirmedCondition) &&
+    isToyConditionConfirmationType(conditionConfirmationType) &&
+    conditionConfirmedAt !== null;
+
+  if (
+    !Number.isInteger(baseSecondHandValueDenars) ||
+    Number(baseSecondHandValueDenars) < 0 ||
+    !isValidConfidence(baseValueConfidence) ||
+    !isToyValuationCondition(aiCondition) ||
+    !isValidConfidence(aiConditionConfidence) ||
+    !isNonblankStringArray(aiConditionNotes) ||
+    !(confirmationIsEmpty || confirmationIsComplete) ||
+    (
+      conditionConfirmationType === 'ACCEPTED_AI' &&
+      confirmedCondition !== aiCondition
+    ) ||
+    !isParentReportedIssueArray(parentReportedIssues) ||
+    parentConditionNote === undefined ||
+    !Number.isInteger(conditionAdjustmentBasisPoints) ||
+    Number(conditionAdjustmentBasisPoints) < -10000 ||
+    Number(conditionAdjustmentBasisPoints) > 10000
+  ) {
+    throw new Error('The persisted toy valuation contains malformed data.');
+  }
+
+  return {
+    ...base,
+    generation: 'v2',
+    baseSecondHandValueDenars: Number(baseSecondHandValueDenars),
+    baseValueConfidence,
+    aiCondition,
+    aiConditionConfidence,
+    aiConditionNotes: aiConditionNotes.map((note) => note.trim()),
+    confirmedCondition: confirmationIsComplete ? confirmedCondition : null,
+    conditionConfirmationType:
+      confirmationIsComplete ? conditionConfirmationType : null,
+    conditionConfirmedAt: confirmationIsComplete ? conditionConfirmedAt : null,
+    parentReportedIssues,
+    parentConditionNote,
+    conditionAdjustmentBasisPoints: Number(conditionAdjustmentBasisPoints),
+    updatedAt,
+  };
+}
+
+const V2_FIELD_NAMES = [
+  'base_second_hand_value_denars',
+  'base_value_confidence',
+  'ai_condition',
+  'ai_condition_confidence',
+  'ai_condition_notes',
+  'confirmed_condition',
+  'condition_confirmation_type',
+  'condition_confirmed_at',
+  'parent_reported_issues',
+  'parent_condition_note',
+  'condition_adjustment_basis_points',
+] as const;
+
+function hasOnlyNullV2Fields(value: Record<string, unknown>): boolean {
+  return V2_FIELD_NAMES.every((fieldName) => value[fieldName] === null);
+}
+
+function isNonblankStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) &&
+    value.every((item) => Boolean(readNonblankString(item)));
+}
+
+function isParentReportedIssueArray(
+  value: unknown,
+): value is ParentReportedToyIssue[] {
+  return Array.isArray(value) && value.every(isParentReportedToyIssue);
 }
 
 function isValidConfidence(value: unknown): value is number | null {
@@ -148,6 +332,14 @@ function readNonblankString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function readNullableNonblankString(value: unknown): string | null | undefined {
+  if (value === null) {
+    return null;
+  }
+
+  return readNonblankString(value) ?? undefined;
+}
+
 function readTimestamp(value: unknown): string {
   if (
     typeof value !== 'string' ||
@@ -158,6 +350,10 @@ function readTimestamp(value: unknown): string {
   }
 
   return value;
+}
+
+function readNullableTimestamp(value: unknown): string | null {
+  return value === null ? null : readTimestamp(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

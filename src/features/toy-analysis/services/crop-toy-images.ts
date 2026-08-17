@@ -1,5 +1,6 @@
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 
+import { expandAndClampNormalizedRegion } from '@/features/toy-analysis/domain/crop-region';
 import type {
   DetectedToyCandidate,
   LocalToyCandidateImage,
@@ -10,6 +11,7 @@ import type {
 } from '@/features/toy-analysis/types/toy-analysis';
 
 export const TOY_CROP_PADDING_RATIO = 0.075;
+export const FINAL_TOY_CROP_PADDING_RATIO = 0.11;
 const CROP_COMPRESSION = 0.92;
 const SEMANTIC_MAX_SIDE = 512;
 const SEMANTIC_COMPRESSION = 0.88;
@@ -39,11 +41,10 @@ async function createLocalToyCandidateImage(
       sourceImage.width,
       sourceImage.height,
     );
-    const crop = addPaddingAndClamp(
-      pixelCrop,
+    const crop = normalizedBoxToPixels(
+      expandAndClampNormalizedRegion(candidate.boundingBox, TOY_CROP_PADDING_RATIO),
       sourceImage.width,
       sourceImage.height,
-      TOY_CROP_PADDING_RATIO,
     );
     const cropContext = ImageManipulator.manipulate(sourceImage.uri);
     cropContext.crop(crop);
@@ -124,12 +125,11 @@ async function addLocalToyCrop(
       sourceImage.width,
       sourceImage.height,
     );
-    const crop = addPaddingAndClamp(
-      pixelCrop,
-      sourceImage.width,
-      sourceImage.height,
-      TOY_CROP_PADDING_RATIO,
+    const paddedRegion = expandAndClampNormalizedRegion(
+      toy.boundingBox,
+      FINAL_TOY_CROP_PADDING_RATIO,
     );
+    const crop = normalizedBoxToPixels(paddedRegion, sourceImage.width, sourceImage.height);
 
     logCropGeometry(toy, sourceImage, pixelCrop, crop);
 
@@ -153,33 +153,10 @@ function normalizedBoxToPixels(
   imageWidth: number,
   imageHeight: number,
 ): { originX: number; originY: number; width: number; height: number } {
-  return {
-    originX: box.x * imageWidth,
-    originY: box.y * imageHeight,
-    width: box.width * imageWidth,
-    height: box.height * imageHeight,
-  };
-}
-
-function addPaddingAndClamp(
-  crop: { originX: number; originY: number; width: number; height: number },
-  imageWidth: number,
-  imageHeight: number,
-  paddingRatio: number,
-): { originX: number; originY: number; width: number; height: number } {
-  const horizontalPadding = crop.width * paddingRatio;
-  const verticalPadding = crop.height * paddingRatio;
-
-  const originX = Math.max(0, Math.floor(crop.originX - horizontalPadding));
-  const originY = Math.max(0, Math.floor(crop.originY - verticalPadding));
-  const right = Math.min(
-    imageWidth,
-    Math.ceil(crop.originX + crop.width + horizontalPadding),
-  );
-  const bottom = Math.min(
-    imageHeight,
-    Math.ceil(crop.originY + crop.height + verticalPadding),
-  );
+  const originX = Math.max(0, Math.floor(box.x * imageWidth));
+  const originY = Math.max(0, Math.floor(box.y * imageHeight));
+  const right = Math.min(imageWidth, Math.ceil((box.x + box.width) * imageWidth));
+  const bottom = Math.min(imageHeight, Math.ceil((box.y + box.height) * imageHeight));
 
   return {
     originX,

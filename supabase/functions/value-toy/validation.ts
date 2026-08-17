@@ -1,8 +1,5 @@
 export type ValueToyRequest = {
   toyAnalysisItemId: string;
-  name: string;
-  category: string | null;
-  imagePath?: string | null;
 };
 
 export type ValueToyRequestValidation =
@@ -14,44 +11,19 @@ export function validateValueToyRequest(value: unknown): ValueToyRequestValidati
     return { ok: false, error: 'Request body must be a JSON object.' };
   }
 
+  if (!hasExactKeys(value, ['toyAnalysisItemId'])) {
+    return { ok: false, error: 'Request body contains unsupported fields.' };
+  }
+
   const toyAnalysisItemId = readNonblankString(value.toyAnalysisItemId);
-  const name = readNonblankString(value.name);
 
   if (!toyAnalysisItemId) {
     return { ok: false, error: 'toyAnalysisItemId is required.' };
   }
 
-  if (!name) {
-    return { ok: false, error: 'name is required.' };
-  }
-
-  if (!(value.category === null || typeof value.category === 'string')) {
-    return { ok: false, error: 'category must be a string or null.' };
-  }
-
-  const category = typeof value.category === 'string'
-    ? value.category.trim()
-    : null;
-
-  const hasImagePath = 'imagePath' in value;
-  const imagePath = value.imagePath;
-
-  if (hasImagePath && imagePath !== null) {
-    if (typeof imagePath !== 'string' || !imagePath.trim()) {
-      return { ok: false, error: 'imagePath must be a nonblank string or null.' };
-    }
-  }
-
   return {
     ok: true,
-    value: {
-      toyAnalysisItemId,
-      name,
-      category,
-      ...(hasImagePath
-        ? { imagePath: imagePath === null ? null : (imagePath as string).trim() }
-        : {}),
-    },
+    value: { toyAnalysisItemId },
   };
 }
 
@@ -61,4 +33,10 @@ function readNonblankString(value: unknown): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, expectedKeys: string[]): boolean {
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }

@@ -5,71 +5,30 @@ declare const Deno: {
   test(name: string, test: () => void | Promise<void>): void;
 };
 
-Deno.test('accepts and normalizes a complete value-toy request', () => {
-  const result = validateValueToyRequest({
+Deno.test('accepts and normalizes an item-ID-only request', () => {
+  assertJsonEqual(validateValueToyRequest({
     toyAnalysisItemId: '  item-1  ',
-    name: '  Wooden blocks  ',
-    category: '  Building toy  ',
-    imagePath: '  user/analysis/item-1.jpg  ',
-  });
-
-  assertJsonEqual(result, {
+  }), {
     ok: true,
-    value: {
-      toyAnalysisItemId: 'item-1',
-      name: 'Wooden blocks',
-      category: 'Building toy',
-      imagePath: 'user/analysis/item-1.jpg',
-    },
+    value: { toyAnalysisItemId: 'item-1' },
   });
 });
 
-Deno.test('accepts null category and omitted or null imagePath', () => {
-  const withoutImage = validateValueToyRequest({
-    toyAnalysisItemId: 'item-1',
-    name: 'Toy figure',
-    category: null,
-  });
-  const nullImage = validateValueToyRequest({
-    toyAnalysisItemId: 'item-1',
-    name: 'Toy figure',
-    category: null,
-    imagePath: null,
-  });
-
-  assertEqual(withoutImage.ok, true);
-  assertEqual(nullImage.ok, true);
-});
-
-Deno.test('rejects malformed top-level values', () => {
+Deno.test('rejects malformed requests and blank item IDs', () => {
   assertEqual(validateValueToyRequest(null).ok, false);
   assertEqual(validateValueToyRequest([]).ok, false);
   assertEqual(validateValueToyRequest('request').ok, false);
+  assertEqual(validateValueToyRequest({ toyAnalysisItemId: '   ' }).ok, false);
 });
 
-Deno.test('rejects blank required fields', () => {
-  assertEqual(validateValueToyRequest(validRequest({ toyAnalysisItemId: '   ' })).ok, false);
-  assertEqual(validateValueToyRequest(validRequest({ name: '\t' })).ok, false);
+Deno.test('rejects legacy client-supplied valuation fields', () => {
+  for (const legacyField of ['name', 'category', 'imagePath']) {
+    assertEqual(validateValueToyRequest({
+      toyAnalysisItemId: 'item-1',
+      [legacyField]: legacyField === 'category' ? null : 'client-value',
+    }).ok, false);
+  }
 });
-
-Deno.test('rejects invalid category values', () => {
-  assertEqual(validateValueToyRequest(validRequest({ category: undefined })).ok, false);
-  assertEqual(validateValueToyRequest(validRequest({ category: 4 })).ok, false);
-});
-
-Deno.test('rejects a supplied blank or non-string imagePath', () => {
-  assertEqual(validateValueToyRequest(validRequest({ imagePath: '   ' })).ok, false);
-  assertEqual(validateValueToyRequest(validRequest({ imagePath: 4 })).ok, false);
-});
-
-function validRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    toyAnalysisItemId: 'item-1',
-    name: 'Toy figure',
-    category: 'Toy figure',
-    ...overrides,
-  };
-}
 
 function assertEqual(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
