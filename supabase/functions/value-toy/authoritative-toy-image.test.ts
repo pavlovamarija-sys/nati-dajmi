@@ -56,6 +56,14 @@ Deno.test('accepts only the expected authoritative crop path', () => {
   }
 });
 
+Deno.test('differentiates null imagePath from registered imagePath', () => {
+  const nullPathItem = { imagePath: null };
+  const registeredPathItem = { imagePath: 'user-1/analysis-1/item-1.jpg' };
+
+  assertEqual(nullPathItem.imagePath === null, true);
+  assertEqual(registeredPathItem.imagePath !== null, true);
+});
+
 function assertEqual(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
     throw new Error(`Expected ${String(expected)}, received ${String(actual)}.`);

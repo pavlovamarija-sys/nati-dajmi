@@ -3,7 +3,7 @@ import { createClient } from 'npm:@supabase/supabase-js@2.112.2';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import { isExpectedAuthoritativeToyImagePath, TOY_IMAGE_BUCKET, validateAuthoritativeToyImage, type AuthoritativeToyImageResult } from './authoritative-toy-image.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
-import { parseAuthoritativeToy, type AuthoritativeToy } from './authoritative-toy.ts';
+import { canStartAuthoritativeToyValuation, parseAuthoritativeToy, type AuthoritativeToy } from './authoritative-toy.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
 import { validateValueToyRequest } from './validation.ts';
 // @ts-ignore Deno requires explicit TypeScript extensions for local modules.
@@ -68,12 +68,25 @@ Deno.serve(async (request) => {
     );
   }
 
+  if (!canStartAuthoritativeToyValuation(lookup.toy)) {
+    console.warn('value-toy authoritative crop is not ready.', {
+      reason: 'expected-crop-path-missing',
+    });
+    return jsonResponse({ error: 'Toy image is not ready for valuation.' }, 409);
+  }
+
   const imageResult = await loadAuthoritativeToyImage(
     authentication.client,
     authentication.userId,
     lookup.toy,
   );
   if (!imageResult.available) {
+    if (lookup.toy.imagePath !== null) {
+      console.error('value-toy authoritative image failed to load.', {
+        reason: imageResult.reason,
+      });
+      return jsonResponse({ error: 'Authoritative toy image could not be loaded.' }, 502);
+    }
     console.warn('value-toy authoritative image is unavailable.', {
       reason: imageResult.reason,
     });
@@ -205,7 +218,7 @@ async function loadAuthoritativeToy(
 ): Promise<ToyLookupResult> {
   const { data, error } = await client
     .from('toy_analysis_items')
-    .select('id, analysis_id, name, category, image_path')
+    .select('id, analysis_id, name, category, image_path, crop_expected')
     .eq('id', toyAnalysisItemId)
     .maybeSingle();
 

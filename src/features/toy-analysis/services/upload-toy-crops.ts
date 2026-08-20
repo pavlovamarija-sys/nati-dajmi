@@ -1,9 +1,14 @@
 import { File } from 'expo-file-system';
 
 import { supabase } from '@/lib/supabase/client';
+import { persistDeterministicToyCrop } from '../../../../shared/toy-crop-persistence';
 
 const TOY_IMAGE_BUCKET = 'toy-shelf-images';
 const ANALYSIS_FUNCTION = 'analyze-toy-shelf';
+export const TOY_CROP_UPLOAD_OPTIONS = {
+  contentType: 'image/jpeg',
+  upsert: false,
+} as const;
 
 export type ToyCropUpload = {
   toyItemId: string;
@@ -49,7 +54,7 @@ export function buildToyCropObjectPath(
   return `${authenticatedUserId}/${analysisId}/${toyItemId}.jpg`;
 }
 
-async function persistOneToyCrop(
+export async function persistOneToyCrop(
   authenticatedUserId: string,
   analysisId: string,
   crop: ToyCropUpload,
@@ -67,33 +72,26 @@ async function persistOneToyCrop(
       throw new Error('Local high-quality crop is unavailable.');
     }
 
-    const imageBytes = await cropFile.arrayBuffer();
-    const { error: uploadError } = await supabase.storage
-      .from(TOY_IMAGE_BUCKET)
-      .upload(imagePath, imageBytes, {
-        contentType: 'image/jpeg',
-        upsert: false,
-      });
-
-    if (uploadError) {
-      throw uploadError;
-    }
-
-    const { error: registrationError } = await supabase.functions.invoke(
-      ANALYSIS_FUNCTION,
-      {
-        body: {
-          mode: 'register-crop',
-          analysisId,
-          toyItemId: crop.toyItemId,
-          imagePath,
-        },
+    const outcome = await persistDeterministicToyCrop({
+      objectExists: () => toyCropObjectExists(imagePath!),
+      async upload() {
+        const imageBytes = await cropFile.arrayBuffer();
+        const { error } = await supabase.storage
+          .from(TOY_IMAGE_BUCKET)
+          .upload(imagePath!, imageBytes, TOY_CROP_UPLOAD_OPTIONS);
+        return error === null;
       },
-    );
+      async register() {
+        return (await registerCropPath(analysisId, crop.toyItemId, imagePath!)) === null;
+      },
+    });
 
-    if (registrationError) {
-      await removeUnregisteredObject(imagePath);
-      throw registrationError;
+    if (outcome !== 'persisted') {
+      throw new Error(
+        outcome === 'registration-failed'
+          ? 'Toy crop registration failed.'
+          : 'Toy crop upload failed.',
+      );
     }
 
     logDevelopmentEvent('crop_persistence_completed', {
@@ -116,14 +114,51 @@ async function persistOneToyCrop(
   }
 }
 
-async function removeUnregisteredObject(imagePath: string): Promise<void> {
-  const { error } = await supabase.storage.from(TOY_IMAGE_BUCKET).remove([imagePath]);
-  if (error) {
-    logDevelopmentEvent('crop_cleanup_failed', {
-      errorName: error.name,
-      errorMessage: error.message,
-    }, 'warn');
+export async function recoverExistingToyCrop(
+  authenticatedUserId: string,
+  analysisId: string,
+  toyItemId: string,
+): Promise<boolean> {
+  try {
+    const imagePath = buildToyCropObjectPath(authenticatedUserId, analysisId, toyItemId);
+    return await persistDeterministicToyCrop({
+      objectExists: () => toyCropObjectExists(imagePath),
+      async upload() { return false; },
+      async register() {
+        return (await registerCropPath(analysisId, toyItemId, imagePath)) === null;
+      },
+    }) === 'persisted';
+  } catch {
+    return false;
   }
+}
+
+async function registerCropPath(
+  analysisId: string,
+  toyItemId: string,
+  imagePath: string,
+): Promise<unknown | null> {
+  const { error } = await supabase.functions.invoke(ANALYSIS_FUNCTION, {
+    body: { mode: 'register-crop', analysisId, toyItemId, imagePath },
+  });
+  return error ?? null;
+}
+
+async function toyCropObjectExists(imagePath: string): Promise<boolean> {
+  const separatorIndex = imagePath.lastIndexOf('/');
+  const folder = separatorIndex > 0 ? imagePath.slice(0, separatorIndex) : '';
+  const fileName = separatorIndex > 0 ? imagePath.slice(separatorIndex + 1) : '';
+  if (!folder || !fileName) {
+    return false;
+  }
+
+  const { data, error } = await supabase.storage
+    .from(TOY_IMAGE_BUCKET)
+    .list(folder, { limit: 1, search: fileName });
+  if (error) {
+    throw error;
+  }
+  return data?.some((object) => object.name === fileName) ?? false;
 }
 
 function logDevelopmentEvent(
@@ -135,4 +170,3 @@ function logDevelopmentEvent(
     console[level](`[toy-analysis] ${event}`, metadata);
   }
 }
-

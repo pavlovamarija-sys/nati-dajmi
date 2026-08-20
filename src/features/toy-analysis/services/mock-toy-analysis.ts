@@ -34,6 +34,7 @@ export async function analyzeToyShelfMock(
           },
         ],
         boundingBox: { x: 0.05, y: 0.08, width: 0.4, height: 0.35 },
+        cropExpected: false,
       },
       {
         id: 'red-toy-car',
@@ -53,6 +54,7 @@ export async function analyzeToyShelfMock(
           },
         ],
         boundingBox: { x: 0.52, y: 0.1, width: 0.32, height: 0.25 },
+        cropExpected: false,
       },
       {
         id: 'animal-jigsaw-puzzle',
@@ -63,6 +65,7 @@ export async function analyzeToyShelfMock(
         confidence: 0.88,
         playIdeas: [],
         boundingBox: { x: 0.08, y: 0.5, width: 0.35, height: 0.3 },
+        cropExpected: false,
       },
       {
         id: 'doctor-play-set',
@@ -73,6 +76,7 @@ export async function analyzeToyShelfMock(
         confidence: 0.84,
         playIdeas: [],
         boundingBox: { x: 0.48, y: 0.46, width: 0.42, height: 0.38 },
+        cropExpected: false,
       },
       {
         id: 'soft-baby-rattle',
@@ -83,6 +87,7 @@ export async function analyzeToyShelfMock(
         confidence: 0.9,
         playIdeas: [],
         boundingBox: { x: 0.35, y: 0.78, width: 0.25, height: 0.2 },
+        cropExpected: false,
       },
     ],
   };

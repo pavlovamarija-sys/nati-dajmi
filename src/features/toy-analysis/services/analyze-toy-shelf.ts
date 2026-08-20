@@ -10,7 +10,7 @@ import {
   isLocalDetectorConfigured,
 } from '@/features/toy-analysis/services/detect-toy-candidates';
 import { prepareCanonicalAnalysisImage } from '@/features/toy-analysis/services/prepare-analysis-image';
-import { persistToyCropImages } from '@/features/toy-analysis/services/upload-toy-crops';
+import { startBatchToyCropUploads } from '@/features/toy-analysis/services/toy-crop-readiness';
 import type {
   SupportedImageMimeType,
   LocalToyCandidateImage,
@@ -190,11 +190,11 @@ async function analyzeWithLocalDetector(
   }
 
   const resultWithCrops = await addLocalToyCrops(result, canonicalImage);
-  await persistAcceptedToyCrops(resultWithCrops);
+  void queueAcceptedToyCrops(resultWithCrops);
   return resultWithCrops;
 }
 
-async function persistAcceptedToyCrops(result: ToyAnalysisResult): Promise<void> {
+async function queueAcceptedToyCrops(result: ToyAnalysisResult): Promise<void> {
   const crops = result.toys.flatMap((toy) =>
     toy.imageUri ? [{ toyItemId: toy.id, imageUri: toy.imageUri }] : [],
   );
@@ -212,16 +212,11 @@ async function persistAcceptedToyCrops(result: ToyAnalysisResult): Promise<void>
       return;
     }
 
-    const persistence = await persistToyCropImages(
+    startBatchToyCropUploads(
       data.user.id,
       result.analysisId,
       crops,
     );
-    logDevelopmentEvent('crop_persistence_summary', {
-      attemptedCount: crops.length,
-      persistedCount: persistence.persistedToyItemIds.length,
-      failedCount: persistence.failedToyItemIds.length,
-    });
   } catch (error) {
     logDevelopmentEvent('crop_persistence_failed', {
       stage: 'finalization',

@@ -75,6 +75,7 @@ type ToyAnalysisItem = ModelToy & {
   id: string;
   boundingBox: BoundingBox | null;
   candidateId?: string;
+  cropExpected: boolean;
 };
 
 type ToyAnalysisResult = {
@@ -402,6 +403,7 @@ Deno.serve(async (request) => {
     toys: semanticToys.map((toy) => ({
       ...toy,
       boundingBox: localizationByToyId.get(toy.id)?.boundingBox ?? null,
+      cropExpected: false,
     })),
   };
 
@@ -780,6 +782,7 @@ async function analyzeDetectedCandidates(
           title: playIdea.title,
           description: playIdea.description,
         })),
+        cropExpected: true,
         boundingBox: getFinalCandidateRegion(
           originalRegions.get(candidate.candidateId)!,
           primaryRefinement.regions.get(candidate.candidateId),
@@ -1487,6 +1490,7 @@ async function persistAnalysis(
       reason: toy.reason,
       confidence: toy.confidence,
       play_ideas: toy.playIdeas,
+      crop_expected: toy.cropExpected,
     })),
   );
 

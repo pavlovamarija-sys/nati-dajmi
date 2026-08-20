@@ -25,6 +25,7 @@ const ANALYSIS_SELECT = `
     confidence,
     play_ideas,
     image_path,
+    crop_expected,
     created_at
   )
 `;
@@ -79,6 +80,49 @@ export async function getToyAnalysisById(
   }
 
   return addSignedToyImageUrls(result);
+}
+
+export type ToyAnalysisItemCropState = {
+  cropExpected: boolean;
+  imagePath: string | null;
+};
+
+export async function getToyAnalysisItemCropState(
+  toyAnalysisItemId: string,
+): Promise<ToyAnalysisItemCropState | null> {
+  const normalizedItemId = readNonblankString(toyAnalysisItemId);
+
+  if (!normalizedItemId) {
+    throw new Error('A valid toy analysis item ID is required.');
+  }
+
+  const { data, error } = await supabase
+    .from('toy_analysis_items')
+    .select('crop_expected, image_path')
+    .eq('id', normalizedItemId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error('Could not load toy crop readiness.', { cause: error });
+  }
+
+  if (!data) {
+    return null;
+  }
+
+  if (typeof data.crop_expected !== 'boolean') {
+    throw new Error('Toy crop readiness returned malformed data.');
+  }
+
+  const imagePath = typeof data.image_path === 'string' && data.image_path.trim()
+    ? data.image_path.trim()
+    : null;
+
+  if (data.image_path !== null && imagePath === null) {
+    throw new Error('Toy crop readiness returned malformed data.');
+  }
+
+  return { cropExpected: data.crop_expected, imagePath };
 }
 
 function parseHistoryItem(value: unknown): ToyAnalysisHistoryItem {
@@ -170,6 +214,7 @@ function mapPersistedItem(value: unknown): {
       confidence: value.confidence,
       playIdeas: value.play_ideas,
       imagePath: value.image_path,
+      cropExpected: value.crop_expected,
     },
   };
 }

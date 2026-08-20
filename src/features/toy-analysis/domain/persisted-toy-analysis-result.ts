@@ -54,6 +54,7 @@ function parsePersistedToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
         : undefined;
   const confidence = value.confidence;
   const recommendation = value.recommendation;
+  const cropExpected = value.cropExpected;
   const imagePath =
     value.imagePath === null
       ? null
@@ -67,6 +68,7 @@ function parsePersistedToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
     !reason ||
     category === undefined ||
     imagePath === undefined ||
+    typeof cropExpected !== 'boolean' ||
     !isToyRecommendation(recommendation) ||
     !(
       confidence === null ||
@@ -94,6 +96,7 @@ function parsePersistedToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
     confidence,
     playIdeas,
     boundingBox: null,
+    cropExpected,
     imagePath,
   };
 }

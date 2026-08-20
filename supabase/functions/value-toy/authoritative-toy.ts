@@ -4,9 +4,17 @@ export type AuthoritativeToy = {
   name: string;
   category: string | null;
   imagePath: string | null;
+  cropExpected: boolean;
 };
 
-const ROW_KEYS = ['id', 'analysis_id', 'name', 'category', 'image_path'] as const;
+const ROW_KEYS = [
+  'id',
+  'analysis_id',
+  'name',
+  'category',
+  'image_path',
+  'crop_expected',
+] as const;
 
 export function parseAuthoritativeToy(value: unknown): AuthoritativeToy | null {
   if (!isRecord(value) || !hasExactKeys(value, ROW_KEYS)) {
@@ -18,13 +26,15 @@ export function parseAuthoritativeToy(value: unknown): AuthoritativeToy | null {
   const name = readNonblankString(value.name);
   const category = value.category;
   const imagePath = value.image_path;
+  const cropExpected = value.crop_expected;
 
   if (
     !toyAnalysisItemId ||
     !analysisId ||
     !name ||
     !(category === null || typeof category === 'string') ||
-    !(imagePath === null || Boolean(readNonblankString(imagePath)))
+    !(imagePath === null || Boolean(readNonblankString(imagePath))) ||
+    typeof cropExpected !== 'boolean'
   ) {
     return null;
   }
@@ -35,7 +45,12 @@ export function parseAuthoritativeToy(value: unknown): AuthoritativeToy | null {
     name,
     category: typeof category === 'string' ? category.trim() : null,
     imagePath: imagePath === null ? null : readNonblankString(imagePath),
+    cropExpected,
   };
+}
+
+export function canStartAuthoritativeToyValuation(toy: AuthoritativeToy): boolean {
+  return !toy.cropExpected || toy.imagePath !== null;
 }
 
 function readNonblankString(value: unknown): string | null {

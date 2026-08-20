@@ -16,6 +16,13 @@ import {
   confirmToyCondition,
   getOrCreateToyValuation,
 } from '@/features/toy-analysis/services/toy-valuation';
+import { getToyValuation } from '@/features/toy-analysis/repositories/toy-valuation-repository';
+import {
+  clearToyCropUploadStatus,
+  ensureCropReadyForValuation,
+  retryToyCropUpload,
+} from '@/features/toy-analysis/services/toy-crop-readiness';
+import { supabase } from '@/lib/supabase/client';
 import { useToyAnalysisResult } from '@/features/toy-analysis/toy-analysis-result-context';
 import type {
   ToyAnalysisItem,
@@ -99,7 +106,11 @@ export default function ResultsScreen() {
 
               <View style={styles.cardList}>
                 {toys.map((toy) => (
-                  <ToyCard key={toy.id} toy={toy} />
+                  <ToyCard
+                    analysisId={result.analysisId}
+                    key={toy.id}
+                    toy={toy}
+                  />
                 ))}
               </View>
             </View>
@@ -110,7 +121,13 @@ export default function ResultsScreen() {
   );
 }
 
-function ToyCard({ toy }: { toy: ToyAnalysisItem }) {
+function ToyCard({
+  analysisId,
+  toy,
+}: {
+  analysisId: string;
+  toy: ToyAnalysisItem;
+}) {
   const showPlayIdeas =
     toy.recommendation === 'KEEP' &&
     Array.isArray(toy.playIdeas) &&
@@ -148,7 +165,11 @@ function ToyCard({ toy }: { toy: ToyAnalysisItem }) {
         </View>
       ) : null}
 
-      <ToyValuationPanel toyAnalysisItemId={toy.id} />
+      <ToyValuationPanel
+        analysisId={analysisId}
+        toyAnalysisItemId={toy.id}
+        toyImageUri={toy.imageUri}
+      />
     </View>
   );
 }
@@ -185,12 +206,24 @@ const ISSUE_OPTIONS: ParentReportedToyIssue[] = [
   'OTHER',
 ];
 
-function ToyValuationPanel({ toyAnalysisItemId }: { toyAnalysisItemId: string }) {
+function ToyValuationPanel({
+  analysisId,
+  toyAnalysisItemId,
+  toyImageUri,
+}: {
+  analysisId?: string;
+  toyAnalysisItemId: string;
+  toyImageUri?: string;
+}) {
   const [state, setState] = useState<
     | { status: 'loading' }
+    | { status: 'crop-failed' }
     | { status: 'success'; valuation: PersistedToyValuation }
     | { status: 'error' }
   >({ status: 'loading' });
+  const [loadingMessage, setLoadingMessage] = useState(
+    'Ја проценуваме состојбата...',
+  );
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -200,12 +233,58 @@ function ToyValuationPanel({ toyAnalysisItemId }: { toyAnalysisItemId: string })
   const [askingPrice, setAskingPrice] = useState('');
   const [isGifted, setIsGifted] = useState(false);
   const hasLoaded = useRef(false);
+  const isMounted = useRef(true);
+  const retryInFlight = useRef(false);
   const confirmationInFlight = useRef(false);
 
   const loadValuation = useCallback(async () => {
-    setState({ status: 'loading' });
+    if (isMounted.current) {
+      setLoadingMessage('Ја проценуваме состојбата...');
+      setState({ status: 'loading' });
+    }
     try {
+      const existingValuation = await getToyValuation(toyAnalysisItemId);
+      if (!isMounted.current) {
+        return;
+      }
+      if (existingValuation) {
+        if (existingValuation.generation === 'v2') {
+          setEditingCondition(
+            existingValuation.confirmedCondition ?? existingValuation.aiCondition,
+          );
+          setEditingIssues([...existingValuation.parentReportedIssues]);
+          setEditingNote(existingValuation.parentConditionNote ?? '');
+        }
+        setState({ status: 'success', valuation: existingValuation });
+        return;
+      }
+
+      const isReady = await ensureCropReadyForValuation({
+        toyAnalysisItemId,
+        analysisId,
+        toyImageUri,
+        onUploadPending: () => {
+          if (isMounted.current) {
+            setLoadingMessage('Ја подготвуваме фотографијата...');
+          }
+        },
+      });
+
+      if (!isMounted.current) {
+        return;
+      }
+      if (!isReady.ready) {
+        setState({
+          status: isReady.reason === 'crop-unavailable' ? 'crop-failed' : 'error',
+        });
+        return;
+      }
+
+      setLoadingMessage('Ја проценуваме состојбата...');
       const result = await getOrCreateToyValuation(toyAnalysisItemId);
+      if (!isMounted.current) {
+        return;
+      }
       if (result.valuation.generation === 'v2') {
         setEditingCondition(
           result.valuation.confirmedCondition ?? result.valuation.aiCondition,
@@ -215,18 +294,57 @@ function ToyValuationPanel({ toyAnalysisItemId }: { toyAnalysisItemId: string })
       }
       setState({ status: 'success', valuation: result.valuation });
     } catch {
-      setState({ status: 'error' });
+      if (isMounted.current) {
+        setState({ status: 'error' });
+      }
     }
-  }, [toyAnalysisItemId]);
+  }, [toyAnalysisItemId, analysisId, toyImageUri]);
 
   useEffect(() => {
-    if (hasLoaded.current) {
+    isMounted.current = true;
+    if (!hasLoaded.current) {
+      hasLoaded.current = true;
+      void loadValuation();
+    }
+    return () => {
+      isMounted.current = false;
+    };
+  }, [loadValuation]);
+
+  async function handleRetryCrop() {
+    if (retryInFlight.current) {
       return;
     }
-
-    hasLoaded.current = true;
-    void loadValuation();
-  }, [loadValuation]);
+    retryInFlight.current = true;
+    if (isMounted.current) {
+      setLoadingMessage('Ја подготвуваме фотографијата...');
+      setState({ status: 'loading' });
+    }
+    try {
+      if (toyImageUri && analysisId) {
+        const { data: authData, error } = await supabase.auth.getUser();
+        if (error || !authData.user?.id) {
+          if (isMounted.current) {
+            setState({ status: 'error' });
+          }
+          return;
+        }
+        await retryToyCropUpload(authData.user.id, analysisId, {
+          toyItemId: toyAnalysisItemId,
+          imageUri: toyImageUri,
+        });
+      } else {
+        clearToyCropUploadStatus(toyAnalysisItemId);
+      }
+      await loadValuation();
+    } catch {
+      if (isMounted.current) {
+        setState({ status: 'error' });
+      }
+    } finally {
+      retryInFlight.current = false;
+    }
+  }
 
   function openEditor(valuation: ImageAwareToyValuation): void {
     setEditingCondition(valuation.confirmedCondition ?? valuation.aiCondition);
@@ -289,8 +407,24 @@ function ToyValuationPanel({ toyAnalysisItemId }: { toyAnalysisItemId: string })
       <View style={styles.valuationPanel}>
         <View style={styles.valuationLoading}>
           <ActivityIndicator color="#2E6B4F" size="small" />
-          <Text style={styles.valuationLoadingText}>Ја проценуваме состојбата...</Text>
+          <Text style={styles.valuationLoadingText}>{loadingMessage}</Text>
         </View>
+      </View>
+    );
+  }
+
+  if (state.status === 'crop-failed') {
+    return (
+      <View style={styles.valuationPanel}>
+        <Text style={styles.valuationUnavailable}>
+          Не успеавме да ја подготвиме фотографијата за проценка.
+        </Text>
+        <Pressable
+          onPress={() => void handleRetryCrop()}
+          style={styles.valuationRetry}
+        >
+          <Text style={styles.valuationRetryLabel}>Обиди се повторно</Text>
+        </Pressable>
       </View>
     );
   }

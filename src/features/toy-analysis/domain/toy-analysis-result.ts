@@ -53,12 +53,14 @@ function parseToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
         : undefined;
   const confidence = value.confidence;
   const recommendation = value.recommendation;
+  const cropExpected = value.cropExpected;
 
   if (
     !id ||
     !name ||
     !reason ||
     category === undefined ||
+    typeof cropExpected !== 'boolean' ||
     !isToyRecommendation(recommendation) ||
     !(
       confidence === null ||
@@ -87,6 +89,7 @@ function parseToyAnalysisItem(value: unknown): ToyAnalysisItem | null {
     confidence,
     playIdeas,
     boundingBox,
+    cropExpected,
   };
 }
 
