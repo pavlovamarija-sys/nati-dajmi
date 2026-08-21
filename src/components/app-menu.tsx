@@ -20,6 +20,8 @@ const menuItems = [
   { icon: '⌂', label: 'Почетна', route: '/' },
   { icon: '▣', label: 'Анализирај играчки', route: '/analyze' },
   { icon: '≡', label: 'Мои анализи', route: '/history' },
+  { icon: '◇', label: 'Моите играчки', route: '/listings' as Href },
+  { icon: '⇄', label: 'Размена', route: '/exchange' },
   { icon: '?', label: 'Како функционира?', route: '/how-it-works' },
   { icon: '○', label: 'Мој профил', route: '/profile' },
 ] satisfies ReadonlyArray<{ icon: string; label: string; route: Href }>;

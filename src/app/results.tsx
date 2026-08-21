@@ -42,6 +42,8 @@ import {
   hasSuggestedToyPriceRange,
   shouldWarnForToyAskingPrice,
 } from '@/features/toy-analysis/domain/toy-price-presentation';
+import { TOY_CONDITION_LABELS } from '@/features/toy-analysis/domain/toy-condition-presentation';
+import { buildToyExchangeListingReviewRoute } from '@/features/toy-exchange/domain/toy-exchange-listing-review';
 
 const sections: { recommendation: ToyRecommendation; title: string; color: string }[] = [
   { recommendation: 'KEEP', title: 'Задржи', color: '#2E6B4F' },
@@ -167,20 +169,13 @@ function ToyCard({
 
       <ToyValuationPanel
         analysisId={analysisId}
+        recommendation={toy.recommendation}
         toyAnalysisItemId={toy.id}
         toyImageUri={toy.imageUri}
       />
     </View>
   );
 }
-
-const CONDITION_LABELS: Record<ToyCondition, string> = {
-  EXCELLENT: 'Одлична',
-  GOOD: 'Добра',
-  FAIR: 'Солидна',
-  POOR: 'Лоша',
-  UNKNOWN: 'Не може да се процени',
-};
 
 const ISSUE_LABELS: Record<ParentReportedToyIssue, string> = {
   MISSING_PART: 'Недостасува дел',
@@ -208,10 +203,12 @@ const ISSUE_OPTIONS: ParentReportedToyIssue[] = [
 
 function ToyValuationPanel({
   analysisId,
+  recommendation,
   toyAnalysisItemId,
   toyImageUri,
 }: {
   analysisId?: string;
+  recommendation: ToyRecommendation;
   toyAnalysisItemId: string;
   toyImageUri?: string;
 }) {
@@ -473,7 +470,7 @@ function ToyValuationPanel({
     <View style={styles.valuationPanel}>
       <Text style={styles.valuationHeading}>Состојба</Text>
       <Text style={styles.valuationConditionCaption}>
-        Проценето од фотографијата: {CONDITION_LABELS[valuation.aiCondition]}
+        Проценето од фотографијата: {TOY_CONDITION_LABELS[valuation.aiCondition]}
       </Text>
       <Text style={styles.conditionExplanation}>
         Проценката се базира само на она што е видливо на фотографијата. Провери ја состојбата пред да продолжиш.
@@ -497,7 +494,7 @@ function ToyValuationPanel({
                   styles.conditionOptionLabel,
                   editingCondition === condition && styles.conditionOptionLabelSelected,
                 ]}>
-                  {CONDITION_LABELS[condition]}
+                  {TOY_CONDITION_LABELS[condition]}
                 </Text>
               </Pressable>
             ))}
@@ -561,10 +558,10 @@ function ToyValuationPanel({
       ) : (
         <>
           <Text style={styles.confirmedMessage}>Состојбата е потврдена.</Text>
-          <Text style={styles.valuationCondition}>{CONDITION_LABELS[displayedCondition]}</Text>
+          <Text style={styles.valuationCondition}>{TOY_CONDITION_LABELS[displayedCondition]}</Text>
           {valuation.aiCondition !== valuation.confirmedCondition ? (
             <Text style={styles.valuationProvenance}>
-              Проценка од фотографијата: {CONDITION_LABELS[valuation.aiCondition]}
+              Проценка од фотографијата: {TOY_CONDITION_LABELS[valuation.aiCondition]}
             </Text>
           ) : null}
           {issues ? <Text style={styles.valuationIssues}>Пријавено: {issues}</Text> : null}
@@ -579,14 +576,33 @@ function ToyValuationPanel({
       )}
 
       {showAuthoritativePrice ? (
-        <PriceGuidance
-          askingPrice={askingPrice}
-          condition={effectiveCondition}
-          isGifted={isGifted}
-          onAskingPriceChange={setAskingPrice}
-          onGiftChange={setGiftSelection}
-          range={priceRange}
-        />
+        <>
+          <PriceGuidance
+            askingPrice={askingPrice}
+            condition={effectiveCondition}
+            isGifted={isGifted}
+            onAskingPriceChange={setAskingPrice}
+            onGiftChange={setGiftSelection}
+            range={priceRange}
+          />
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => router.push(
+              buildToyExchangeListingReviewRoute(toyAnalysisItemId),
+            )}
+            style={[
+              styles.exchangeListingAction,
+              recommendation !== 'PASS_ON' && styles.exchangeListingActionSecondary,
+            ]}
+          >
+            <Text style={[
+              styles.exchangeListingActionLabel,
+              recommendation !== 'PASS_ON' && styles.exchangeListingActionLabelSecondary,
+            ]}>
+              Понуди за размена
+            </Text>
+          </Pressable>
+        </>
       ) : null}
     </View>
   );
@@ -1027,6 +1043,28 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginTop: 9,
+  },
+  exchangeListingAction: {
+    alignItems: 'center',
+    backgroundColor: '#2E6B4F',
+    borderColor: '#2E6B4F',
+    borderRadius: 10,
+    borderWidth: 1,
+    justifyContent: 'center',
+    marginTop: 18,
+    minHeight: 48,
+    paddingHorizontal: 18,
+  },
+  exchangeListingActionSecondary: {
+    backgroundColor: '#FFFFFF',
+  },
+  exchangeListingActionLabel: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  exchangeListingActionLabelSecondary: {
+    color: '#2E6B4F',
   },
   modalBackdrop: {
     backgroundColor: 'rgba(24, 35, 29, 0.35)',

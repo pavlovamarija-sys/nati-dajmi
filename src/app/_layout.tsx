@@ -38,6 +38,9 @@ function RootNavigator() {
         <Stack.Screen name="instructions/[topic]" />
         <Stack.Screen name="profile" />
         <Stack.Screen name="results" />
+        <Stack.Screen name="exchange" />
+        <Stack.Screen name="listings/new" />
+        <Stack.Screen name="listings/index" />
       </Stack.Protected>
     </Stack>
   );
